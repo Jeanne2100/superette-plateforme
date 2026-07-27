@@ -1,0 +1,17 @@
+# Node
+node_modules/
+
+# Variables secrètes
+.env
+.env.*
+
+# Logs
+npm-debug.log*
+logs/
+
+# Système
+.DS_Store
+Thumbs.db
+
+# Fichiers temporaires
+*.tmp

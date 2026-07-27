@@ -1,0 +1,3078 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Supérette — Gestion</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700;800&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+/* ============================================================
+   MOTEUR QR CODE 100% INTERNE — AUCUNE DÉPENDANCE RÉSEAU / CDN
+   ------------------------------------------------------------
+   Remplace l'ancienne dépendance à qrcode.min.js chargée depuis un CDN
+   (cause du message "QRCode.js manquant" en environnement hors ligne :
+   un <script src="https://..."> ne se charge jamais sans connexion
+   Internet — voir diagnostic complet dans la réponse fournie à l'équipe).
+   Implémentation vanille, sans dépendance : mode Octet (Byte), Reed-Solomon
+   sur GF(256) calculé algorithmiquement (aucune table binaire codée en dur),
+   versions QR 1 à 6 (niveau de correction M), masque fixe n°0 — un choix de
+   masque valide à 100% (le format info encode le masque réellement utilisé,
+   donc la lisibilité par un scanner n'est absolument pas affectée par ce choix).
+   Structure vérifiée manuellement (motifs de repérage, timing, alignement,
+   bits de format) avant intégration.
+   ============================================================ */
+const QRCode = (function () {
+  const VERSION_LABEL = "Supérette-QR-Engine 1.0.0 (interne, hors ligne)";
+
+  // ---- GF(256) : tables calculées à l'exécution, aucune donnée binaire codée en dur ----
+  const EXP = new Array(512);
+  const LOG = new Array(256);
+  (function initGF() {
+    let x = 1;
+    for (let i = 0; i < 255; i++) {
+      EXP[i] = x; LOG[x] = i;
+      x <<= 1;
+      if (x & 0x100) x ^= 0x11D; // polynôme primitif standard QR : x^8+x^4+x^3+x^2+1
+    }
+    for (let i = 255; i < 512; i++) EXP[i] = EXP[i - 255];
+  })();
+  function gmul(a, b) { return (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]]; }
+
+  function rsGeneratorPoly(ecCount) {
+    let g = [1];
+    for (let i = 0; i < ecCount; i++) {
+      const next = new Array(g.length + 1).fill(0);
+      for (let j = 0; j < g.length; j++) {
+        next[j] ^= gmul(g[j], 1);
+        next[j + 1] ^= gmul(g[j], EXP[i]);
+      }
+      g = next;
+    }
+    return g;
+  }
+  function rsEncode(dataCodewords, ecCount) {
+    const gen = rsGeneratorPoly(ecCount);
+    const buf = dataCodewords.concat(new Array(ecCount).fill(0));
+    for (let i = 0; i < dataCodewords.length; i++) {
+      const coef = buf[i];
+      if (coef === 0) continue;
+      for (let j = 0; j < gen.length; j++) buf[i + j] ^= gmul(gen[j], coef);
+    }
+    return buf.slice(dataCodewords.length);
+  }
+
+  // Table des blocs Reed-Solomon — niveau de correction M uniquement, versions 1 à 6
+  // (format [nombre de blocs, total codewords/bloc, codewords de données/bloc], vérifiée par
+  // cohérence interne : totalCodewords(version) = Σ(blocs × total) doit correspondre aux
+  // capacités standard 26/44/70/100/134/172 — c'est bien le cas ici)
+  const RS_BLOCK_TABLE_M = {
+    1: [[1, 26, 16]], 2: [[1, 44, 28]], 3: [[1, 70, 44]],
+    4: [[2, 50, 32]], 5: [[2, 67, 43]], 6: [[4, 43, 27]],
+  };
+  const ALIGNMENT_POS = { 1: null, 2: 18, 3: 22, 4: 26, 5: 30, 6: 34 };
+
+  function pickVersion(byteLength) {
+    for (let v = 1; v <= 6; v++) {
+      const totalData = RS_BLOCK_TABLE_M[v].reduce((s, [n, , d]) => s + n * d, 0);
+      if (byteLength <= totalData - 2) return v; // -2 : marge mode(4b)+longueur(8b)+terminateur
+    }
+    return null; // au-delà de la version 6 (~105 octets) : l'appelant doit utiliser un payload plus court
+  }
+
+  function buildCodewords(version, bytes) {
+    const groups = RS_BLOCK_TABLE_M[version];
+    const totalData = groups.reduce((s, [n, , d]) => s + n * d, 0);
+    const bits = [];
+    const pushBits = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+    pushBits(0b0100, 4); // indicateur de mode : Octet (Byte)
+    pushBits(bytes.length, 8); // indicateur de longueur (8 bits, valide pour versions 1-9)
+    for (const b of bytes) pushBits(b, 8);
+    // Garde-fou : si le contenu dépasse la capacité réelle de cette version, on ÉCHOUE bruyamment plutôt que
+    // de tronquer silencieusement le dernier octet (c'est précisément ce genre de troncature silencieuse
+    // qui a été corrigée : jamais de perte de caractère sans erreur explicite).
+    if (bits.length > totalData * 8) {
+      throw new Error(`Capacité dépassée pour la version ${version} (${bytes.length} octets encodés, ${Math.ceil(bits.length / 8)} nécessaires, ${totalData} disponibles).`);
+    }
+    for (let i = 0; i < 4 && bits.length < totalData * 8; i++) bits.push(0); // terminateur
+    while (bits.length % 8 !== 0) bits.push(0);
+    const dataBytes = [];
+    for (let i = 0; i < bits.length; i += 8) {
+      let byte = 0;
+      for (let j = 0; j < 8; j++) byte = (byte << 1) | bits[i + j];
+      dataBytes.push(byte);
+    }
+    const PAD = [0xEC, 0x11];
+    for (let p = 0; dataBytes.length < totalData; p++) dataBytes.push(PAD[p % 2]);
+
+    const blocks = [];
+    let offset = 0;
+    for (const [count, total, dataCount] of groups) {
+      const ecCount = total - dataCount;
+      for (let i = 0; i < count; i++) {
+        const dataPart = dataBytes.slice(offset, offset + dataCount);
+        offset += dataCount;
+        blocks.push({ data: dataPart, ec: rsEncode(dataPart, ecCount) });
+      }
+    }
+    const maxData = Math.max(...blocks.map(b => b.data.length));
+    const maxEc = Math.max(...blocks.map(b => b.ec.length));
+    const out = [];
+    for (let i = 0; i < maxData; i++) for (const b of blocks) if (i < b.data.length) out.push(b.data[i]);
+    for (let i = 0; i < maxEc; i++) for (const b of blocks) if (i < b.ec.length) out.push(b.ec[i]);
+    return out;
+  }
+
+  function buildMatrix(version, codewords) {
+    const size = version * 4 + 17;
+    const modules = Array.from({ length: size }, () => new Array(size).fill(null));
+    const reserved = Array.from({ length: size }, () => new Array(size).fill(false));
+    function set(r, c, val) { if (r >= 0 && r < size && c >= 0 && c < size) { modules[r][c] = val; reserved[r][c] = true; } }
+
+    function placeFinder(r0, c0) {
+      for (let r = -1; r <= 7; r++) for (let c = -1; c <= 7; c++) {
+        const rr = r0 + r, cc = c0 + c;
+        if (rr < 0 || rr >= size || cc < 0 || cc >= size) continue;
+        const isBorder = r === -1 || r === 7 || c === -1 || c === 7;
+        let val = false;
+        if (!isBorder) {
+          const ring = Math.max(Math.abs(r - 3), Math.abs(c - 3));
+          val = ring !== 2; // bordure + centre 3x3 sombres, anneau intermédiaire clair
+        }
+        set(rr, cc, val);
+      }
+    }
+    placeFinder(0, 0); placeFinder(0, size - 7); placeFinder(size - 7, 0);
+
+    for (let i = 8; i < size - 8; i++) {
+      if (!reserved[6][i]) set(6, i, i % 2 === 0);
+      if (!reserved[i][6]) set(i, 6, i % 2 === 0);
+    }
+    const ap = ALIGNMENT_POS[version];
+    if (ap) for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++) set(ap + r, ap + c, Math.max(Math.abs(r), Math.abs(c)) !== 1);
+    set(size - 8, 8, true); // module sombre fixe
+
+    for (let i = 0; i <= 8; i++) { reserved[8][i] = true; reserved[i][8] = true; }
+    for (let i = 0; i <= 7; i++) reserved[8][size - 1 - i] = true;
+    for (let i = 0; i <= 6; i++) reserved[size - 1 - i][8] = true;
+
+    const bitsTotal = codewords.length * 8;
+    let bitIndex = 0, row = size - 1, dir = -1;
+    for (let col = size - 1; col > 0; col -= 2) {
+      if (col === 6) col--;
+      while (true) {
+        for (let c = 0; c < 2; c++) {
+          const cc = col - c;
+          if (!reserved[row][cc]) {
+            let bit = 0;
+            if (bitIndex < bitsTotal) bit = (codewords[Math.floor(bitIndex / 8)] >>> (7 - (bitIndex % 8))) & 1;
+            const maskBit = (row + cc) % 2 === 0 ? 1 : 0; // masque n°0 fixe
+            modules[row][cc] = (bit ^ maskBit) === 1;
+            bitIndex++;
+          }
+        }
+        row += dir;
+        if (row < 0 || row >= size) { row -= dir; dir = -dir; break; }
+      }
+    }
+
+    // Bits de format : niveau EC=M (00) + masque=000, codés en BCH(15,5) — calculé, pas codé en dur
+    const G15 = 0x537, G15_MASK = 0x5412;
+    function bchDigit(n) { let d = 0; while (n !== 0) { d++; n >>>= 1; } return d; }
+    const d0 = 0 << 10;
+    let d = d0;
+    while (bchDigit(d) - bchDigit(G15) >= 0) d ^= (G15 << (bchDigit(d) - bchDigit(G15)));
+    const fmt = (d0 | d) ^ G15_MASK;
+    const fbits = []; for (let i = 14; i >= 0; i--) fbits.push((fmt >>> i) & 1);
+    for (let i = 0; i <= 5; i++) modules[8][i] = fbits[i] === 1;
+    modules[8][7] = fbits[6] === 1; modules[8][8] = fbits[7] === 1; modules[7][8] = fbits[8] === 1;
+    for (let i = 9; i <= 14; i++) modules[14 - i][8] = fbits[i] === 1;
+    for (let i = 0; i <= 7; i++) modules[8][size - 1 - i] = fbits[i] === 1;
+    for (let i = 8; i <= 14; i++) modules[size - 15 + i][8] = fbits[i] === 1;
+    modules[size - 8][8] = true;
+
+    return modules;
+  }
+
+  function encodeMatrix(text) {
+    const bytes = Array.from(new TextEncoder().encode(text));
+    const version = pickVersion(bytes.length);
+    if (!version) return null; // payload trop long pour ce moteur (>~105 octets) — l'appelant doit réduire le contenu
+    return buildMatrix(version, buildCodewords(version, bytes));
+  }
+
+  function drawToCanvas(canvas, matrix, opts) {
+    const size = matrix.length;
+    const margin = opts && opts.margin != null ? opts.margin : 4;
+    const targetWidth = (opts && opts.width) || 256;
+    const moduleSize = Math.max(1, Math.floor(targetWidth / (size + margin * 2)));
+    const pixelSize = moduleSize * (size + margin * 2);
+    canvas.width = pixelSize; canvas.height = pixelSize;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#FFFFFF"; ctx.fillRect(0, 0, pixelSize, pixelSize);
+    ctx.fillStyle = "#000000";
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (matrix[r][c]) ctx.fillRect((c + margin) * moduleSize, (r + margin) * moduleSize, moduleSize, moduleSize);
+      }
+    }
+  }
+
+  // API compatible avec l'usage existant dans l'application : QRCode.toCanvas(canvas, text, opts) -> Promise
+  async function toCanvas(canvas, text, opts) {
+    const t0 = performance.now();
+    if (opts && opts.errorCorrectionLevel && opts.errorCorrectionLevel !== "M") {
+      console.warn(`[QR moteur interne] Niveau de correction "${opts.errorCorrectionLevel}" non supporté par le moteur hors ligne — niveau M utilisé à la place.`);
+    }
+    const matrix = encodeMatrix(text);
+    if (!matrix) {
+      const err = new Error(`Payload trop long pour le moteur QR interne (max ~105 octets, reçu ${new TextEncoder().encode(text).length} octets).`);
+      console.error(`[QR moteur interne] Échec — ${err.message}`);
+      throw err;
+    }
+    drawToCanvas(canvas, matrix, opts);
+    const dt = (performance.now() - t0).toFixed(2);
+    console.log(`✔ Bibliothèque QR : ${VERSION_LABEL} · ✔ Temps de génération : ${dt} ms · ✔ Taille matrice : ${matrix.length}×${matrix.length}`);
+    return canvas;
+  }
+
+  return { toCanvas, VERSION: VERSION_LABEL };
+})();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.0/dist/JsBarcode.all.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          canvas: "#F6F8FB", surface: "#FFFFFF", border: "#E6EAF2",
+          navy: { 50:"#EEF2F8",100:"#D6DFEC",400:"#3D5A80",600:"#1E3A5F",700:"#152B47",900:"#0B1B2E" },
+          accent: { 50:"#EAFBF1",100:"#CFF5DE",500:"#16A34A",600:"#0F8A3C" },
+          ink: { 900:"#101828",600:"#475467",400:"#98A2B3" },
+          danger: "#DC2626", warning: "#D97706",
+        },
+        fontFamily: {
+          display: ["'Plus Jakarta Sans'","system-ui","sans-serif"],
+          sans: ["'Inter'","system-ui","sans-serif"],
+          mono: ["'IBM Plex Mono'","ui-monospace","monospace"],
+        },
+        boxShadow: { card: "0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06)" },
+      }
+    }
+  }
+</script>
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; }
+  .font-display { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
+  .font-mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+  .card { background:#fff; border:1px solid #E6EAF2; border-radius:0.875rem; box-shadow: 0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.06); }
+  .btn { display:inline-flex; align-items:center; justify-content:center; gap:.5rem; border-radius:.5rem; padding:.6rem 1rem; font-size:.875rem; font-weight:500; transition:background-color .15s; cursor:pointer; border:none; }
+  .btn-primary { background:#152B47; color:#fff; } .btn-primary:hover { background:#0B1B2E; }
+  .btn-accent { background:#16A34A; color:#fff; } .btn-accent:hover { background:#0F8A3C; }
+  .btn-ghost { background:transparent; color:#475467; } .btn-ghost:hover { background:#EEF2F8; }
+  .btn-danger { background:#FEF2F2; color:#DC2626; } .btn-danger:hover { background:#FEE2E2; }
+  .input { width:100%; border-radius:.5rem; border:1px solid #E6EAF2; padding:.6rem .85rem; font-size:.875rem; outline:none; }
+  .input:focus { border-color:#1E3A5F; }
+  .label { display:block; font-size:.75rem; font-weight:500; color:#475467; margin-bottom:.35rem; }
+  table.data th { text-align:left; font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; color:#98A2B3; font-weight:600; padding:.6rem .9rem; border-bottom:1px solid #E6EAF2; }
+  table.data td { padding:.7rem .9rem; font-size:.875rem; border-bottom:1px solid #F0F2F6; vertical-align:middle; }
+  table.data tr:hover td { background:#FAFBFD; }
+  .modal-backdrop { position:fixed; inset:0; background:rgba(11,27,46,.5); display:flex; align-items:center; justify-content:center; z-index:50; padding:1rem; }
+  .toast { position:fixed; bottom:1.25rem; right:1.25rem; z-index:60; }
+  ::-webkit-scrollbar { width:8px; height:8px; } ::-webkit-scrollbar-thumb { background:#D6DFEC; border-radius:4px; }
+</style>
+</head>
+<body class="bg-canvas text-ink-900">
+
+<!-- ===================== CONNEXION ===================== -->
+<div id="screen-login" class="min-h-screen flex items-center justify-center bg-navy-900 px-4">
+  <div class="w-full max-w-sm">
+    <div class="flex flex-col items-center mb-8">
+      <div id="brand-logo-login" class="w-11 h-11 rounded-xl bg-accent-500 flex items-center justify-center font-display font-bold text-white text-lg mb-3 overflow-hidden">S</div>
+      <h1 id="brand-name-login" class="font-display font-bold text-xl text-white">Supérette</h1>
+      <p class="text-sm text-white/50 font-mono">GESTION</p>
+    </div>
+    <div class="card p-6 space-y-4">
+      <div>
+        <label class="label">Compte</label>
+        <select id="login-user" class="input"></select>
+      </div>
+      <div>
+        <label class="label">Mot de passe</label>
+        <input id="login-password" type="password" class="input" placeholder="••••••••" />
+      </div>
+      <p id="login-error" class="hidden text-sm text-danger bg-red-50 border border-red-200 rounded-lg px-3 py-2"></p>
+      <button onclick="handleLogin()" class="btn-primary w-full">Se connecter</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== APPLICATION ===================== -->
+<div id="screen-app" class="hidden min-h-screen flex bg-canvas">
+  <div id="sidebar-backdrop" class="hidden fixed inset-0 bg-black/40 z-30 lg:hidden transition-opacity duration-200 opacity-0"></div>
+  <aside id="sidebar" class="fixed lg:sticky top-0 left-0 z-40 flex flex-col w-72 lg:w-64 shrink-0 bg-navy-900 text-white h-screen -translate-x-full lg:translate-x-0 transition-transform duration-300 ease-out">
+    <div class="px-6 py-6 border-b border-white/10 flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <div id="brand-logo-sidebar" class="w-8 h-8 rounded-lg bg-accent-500 flex items-center justify-center font-display font-bold text-sm overflow-hidden">S</div>
+        <div><p id="brand-name-sidebar" class="font-display font-bold text-[15px] leading-tight">Supérette</p><p class="text-[11px] text-white/50 font-mono tracking-wide">GESTION</p></div>
+      </div>
+      <button id="btn-close-sidebar" class="lg:hidden p-1.5 rounded-lg text-white/60 hover:text-white hover:bg-white/10" title="Fermer le menu">✕</button>
+    </div>
+    <nav id="nav-container" class="flex-1 overflow-y-auto py-4 px-3 space-y-6"></nav>
+    <div class="p-3 border-t border-white/10">
+      <p class="text-xs text-white/30 px-3 py-2">Supérette — Gestion</p>
+    </div>
+  </aside>
+
+  <div class="flex-1 min-w-0">
+    <header class="sticky top-0 z-10 bg-canvas/80 backdrop-blur-sm border-b border-border">
+      <div class="flex items-center justify-between px-4 sm:px-6 lg:px-8 h-16">
+        <div class="flex items-center gap-3 min-w-0">
+          <button id="btn-open-sidebar" class="lg:hidden p-2 -ml-2 rounded-lg text-ink-600 hover:bg-navy-50 shrink-0" title="Menu" aria-label="Ouvrir le menu">☰</button>
+          <h1 id="page-title" class="font-display font-semibold text-base sm:text-lg truncate">Tableau de bord</h1>
+        </div>
+        <div class="flex items-center gap-2 sm:gap-4 shrink-0">
+          <div class="text-right hidden sm:block">
+            <p id="topbar-username" class="text-sm font-medium leading-tight">—</p>
+            <p id="topbar-userrole" class="text-xs text-ink-400">—</p>
+          </div>
+          <div id="topbar-avatar" class="w-9 h-9 rounded-full bg-navy-100 text-navy-700 flex items-center justify-center font-display font-semibold text-sm">A</div>
+          <button onclick="handleLogout()" class="p-2 rounded-lg text-ink-400 hover:text-danger hover:bg-red-50 transition-colors" title="Se déconnecter">⏻</button>
+        </div>
+      </div>
+    </header>
+    <main class="px-4 sm:px-6 lg:px-8 py-6" id="page-root"></main>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root" class="toast"></div>
+
+<script>
+/* ============================================================
+   COUCHE DONNÉES — client API vers le backend (PostgreSQL centralisé).
+   Remplace l'ancien stockage localStorage : toutes les données sont désormais partagées
+   entre tous les appareils/utilisateurs via cette API sécurisée (JWT + bcrypt côté serveur).
+   ============================================================ */
+// Adresse du backend déployé (Render/Railway...) — à renseigner une fois le backend en ligne.
+const API_BASE_URL ="https://TON-BACKEND-RENDER.onrender.com";
+
+let AUTH_TOKEN = sessionStorage.getItem("superette_api_token") || null;
+
+async function apiRequest(method, path, body) {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers: { "Content-Type": "application/json", ...(AUTH_TOKEN ? { Authorization: `Bearer ${AUTH_TOKEN}` } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data;
+  try { data = await res.json(); } catch (e) { data = null; }
+  if (!res.ok) throw new Error((data && data.error) || `Erreur réseau (${res.status})`);
+  return data;
+}
+
+const Api = {
+  async login(email, password) {
+    const { token, user } = await apiRequest("POST", "/api/auth/login", { email, password });
+    AUTH_TOKEN = token;
+    sessionStorage.setItem("superette_api_token", token);
+    return user;
+  },
+  logout() { AUTH_TOKEN = null; sessionStorage.removeItem("superette_api_token"); },
+  me: () => apiRequest("GET", "/api/auth/me"),
+  products: {
+    list: () => apiRequest("GET", "/api/products"),
+    create: (p) => apiRequest("POST", "/api/products", p),
+    update: (id, p) => apiRequest("PUT", `/api/products/${id}`, p),
+    remove: (id) => apiRequest("DELETE", `/api/products/${id}`),
+  },
+  categories: {
+    list: () => apiRequest("GET", "/api/categories"),
+    create: (c) => apiRequest("POST", "/api/categories", c),
+    update: (id, c) => apiRequest("PUT", `/api/categories/${id}`, c),
+    remove: (id) => apiRequest("DELETE", `/api/categories/${id}`),
+  },
+  suppliers: {
+    list: () => apiRequest("GET", "/api/suppliers"),
+    create: (s) => apiRequest("POST", "/api/suppliers", s),
+    update: (id, s) => apiRequest("PUT", `/api/suppliers/${id}`, s),
+    remove: (id) => apiRequest("DELETE", `/api/suppliers/${id}`),
+  },
+  clients: {
+    list: () => apiRequest("GET", "/api/clients"),
+    create: (c) => apiRequest("POST", "/api/clients", c),
+    update: (id, c) => apiRequest("PUT", `/api/clients/${id}`, c),
+    remove: (id) => apiRequest("DELETE", `/api/clients/${id}`),
+  },
+  sales: {
+    list: () => apiRequest("GET", "/api/sales"),
+    create: (sale) => apiRequest("POST", "/api/sales", sale),
+    addPayment: (saleId, amount) => apiRequest("POST", `/api/sales/${saleId}/payments`, { amount }),
+    reportSummary: (start, end) => apiRequest("GET", `/api/sales/reports/summary?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`),
+  },
+  stockMovements: {
+    list: (productId) => apiRequest("GET", `/api/stock-movements${productId ? `?productId=${productId}` : ""}`),
+    adjust: (productId, type, quantity, reason) => apiRequest("POST", "/api/stock-movements", { productId, type, quantity, reason }),
+  },
+  settings: {
+    get: () => apiRequest("GET", "/api/settings"),
+    update: (s) => apiRequest("PUT", "/api/settings", s),
+  },
+  users: {
+    loginList: () => apiRequest("GET", "/api/users/login-list"),
+    list: () => apiRequest("GET", "/api/users"),
+    create: (u) => apiRequest("POST", "/api/users", u),
+    update: (id, u) => apiRequest("PUT", `/api/users/${id}`, u),
+    remove: (id) => apiRequest("DELETE", `/api/users/${id}`),
+  },
+  logs: { list: (entity) => apiRequest("GET", `/api/logs${entity ? `?entity=${entity}` : ""}`) },
+};
+
+// Informations par défaut de l'entreprise — utilisées avant le premier chargement et par "Restaurer les valeurs par défaut"
+const DEFAULT_COMPANY = {
+  name: "Supérette", ownerName: "", phone: "", whatsapp: "", address: "", city: "",
+  country: "Guinée", email: "", slogan: "Qualité et proximité, chaque jour.",
+  lat: "", lng: "", logo: null, // logo : chaîne Base64 ou null
+  website: "", rccm: "", nif: "", currency: "GNF", timezone: "Africa/Conakry",
+  printer: {
+    type: "POS80", // EPSON, XPRINTER, POS58, POS80, SUNMI, A4, AUTRE (tous compatibles ESC/POS sauf A4)
+    showLogo: true, showName: true, showAddress: true, showPhone: true, showTaxIds: true,
+    showCashier: true, showDateTime: true, showTicketNumber: true, showQr: true,
+    showThanks: true, showTerms: false, termsText: "",
+  },
+};
+// Image affichée par défaut quand un produit n'a pas de photo (SVG encodé en Base64, aucune requête réseau)
+const DEFAULT_PRODUCT_IMAGE = "data:image/svg+xml;base64," + btoa(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120">' +
+  '<rect width="120" height="120" fill="#EEF2F8"/>' +
+  '<path d="M40 78 L55 58 L68 72 L78 55 L92 78 Z" fill="#D6DFEC"/>' +
+  '<circle cx="46" cy="46" r="8" fill="#D6DFEC"/></svg>'
+);
+
+function uid(prefix) {
+  return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+function genQrValue() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let code = "PRD-";
+  for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+// Extrait le code produit d'un texte scanné/collé : accepte un QR "intelligent" (JSON {qr:"..."})
+// ou un ancien code brut, pour garder la compatibilité du scanner avec les deux formats.
+function extractQrCode(raw) {
+  const trimmed = (raw || "").trim();
+  try {
+    const parsed = JSON.parse(trimmed);
+    // "sku" est le champ actuel des QR produits (voir buildQrPayload) ; "qr" reste accepté
+    // pour rester compatible avec d'anciennes étiquettes déjà imprimées avant ce renommage.
+    if (parsed && (parsed.sku || parsed.qr)) return parsed.sku || parsed.qr;
+  } catch (e) { /* pas du JSON : code brut classique (SKU tapé/scanné, code-barres...) */ }
+  return trimmed;
+}
+function fmtGNF(v) {
+  return `${new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(v || 0)} GNF`;
+}
+function fmtDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "numeric" });
+}
+function fmtDateTime(iso) {
+  return new Date(iso).toLocaleString("fr-FR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+function todayStart() {
+  const d = new Date(); d.setHours(0, 0, 0, 0); return d;
+}
+
+// Démarrage professionnel : plus aucune donnée fictive ni stockage local — toutes les données vivent
+// désormais dans la base de données centrale, via l'API (voir Api.* défini plus haut). Le compte
+// administrateur initial est créé une fois par `node scripts/create-admin.js` côté backend.
+function resetApplicationData() {
+  alert("La réinitialisation complète n'est plus disponible depuis le navigateur : les données sont maintenant partagées entre tous les appareils dans une base centrale. Utilise les scripts backend/scripts/backup.sh et restore.sh (ou l'outil d'administration de ta base) pour une opération de ce type.");
+}
+
+let DB = { categories: [], products: [], clients: [], suppliers: [], users: [], sales: [], stockMovements: [], company: { ...DEFAULT_COMPANY } };
+let CURRENT_USER = null;
+let CART = [];
+let LAST_SALE_ID = null; // dernière vente validée, pour le raccourci F10 (réimprimer le ticket)
+let ACTIVE_PAGE = "dashboard";
+let SCANNER = null;
+
+// Recharge l'intégralité du cache local DB.* depuis l'API — appelé après connexion, et après toute
+// opération qui doit rester visible immédiatement sur tous les appareils après actualisation.
+// Chaque ressource est chargée indépendamment (pas de Promise.all global) : un utilisateur sans la
+// permission "ventes" (ex. un Caissier) ne doit pas empêcher le reste des données de se charger.
+async function loadAllData() {
+  const safe = async (fn, fallback) => { try { return await fn(); } catch (err) { return fallback; } };
+  DB.categories = await safe(() => Api.categories.list(), []);
+  DB.products = await safe(() => Api.products.list(), []);
+  DB.clients = await safe(() => Api.clients.list(), []);
+  DB.suppliers = await safe(() => Api.suppliers.list(), []);
+  DB.sales = await safe(() => Api.sales.list(), []); // vide si l'utilisateur n'a pas la permission "ventes"
+  const settings = await safe(() => Api.settings.get(), {});
+  DB.company = { ...DEFAULT_COMPANY, ...settings, printer: { ...DEFAULT_COMPANY.printer, ...(settings.printer || {}) } };
+  if (canSeePage(CURRENT_USER, "utilisateurs")) DB.users = await safe(() => Api.users.list(), []);
+}
+
+/* ============================================================
+   UTILITAIRES UI — toast, modal
+   ============================================================ */
+function toast(message, tone = "accent") {
+  const colors = { accent: "bg-accent-500", danger: "bg-danger", navy: "bg-navy-700" };
+  const el = document.createElement("div");
+  el.className = `${colors[tone]} text-white text-sm font-medium px-4 py-3 rounded-lg shadow-lg mb-2 transition-opacity duration-300`;
+  el.textContent = message;
+  document.getElementById("toast-root").appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 300); }, 2600);
+}
+
+function openModal(title, bodyHtml, { size = "max-w-lg" } = {}) {
+  const root = document.getElementById("modal-root");
+  root.innerHTML = `
+    <div class="modal-backdrop" id="modal-backdrop">
+      <div class="card ${size} w-full max-h-[90vh] overflow-y-auto">
+        <div class="flex items-center justify-between px-5 py-4 border-b border-border">
+          <h3 class="font-display font-semibold text-base">${title}</h3>
+          <button onclick="closeModal()" class="text-ink-400 hover:text-ink-900 text-xl leading-none">&times;</button>
+        </div>
+        <div class="p-5">${bodyHtml}</div>
+      </div>
+    </div>`;
+  document.getElementById("modal-backdrop").addEventListener("click", (e) => {
+    if (e.target.id === "modal-backdrop") closeModal();
+  });
+}
+function closeModal() {
+  stopScanner();
+  document.getElementById("modal-root").innerHTML = "";
+}
+
+/* ============================================================
+   AUTHENTIFICATION — via l'API (voir Api.login / Api.users.loginList)
+   ============================================================ */
+let LOGIN_USERS_CACHE = []; // {id, name, email, role} — pour retrouver l'e-mail associé au compte choisi dans la liste
+async function populateLoginUsers() {
+  const sel = document.getElementById("login-user");
+  try {
+    LOGIN_USERS_CACHE = await Api.users.loginList();
+    sel.innerHTML = LOGIN_USERS_CACHE.map(u => `<option value="${u.id}">${u.name} — ${roleLabel(u.role)}</option>`).join("");
+  } catch (err) {
+    sel.innerHTML = "";
+    toast(`Impossible de contacter le serveur (${err.message}). Vérifie la connexion et l'adresse de l'API.`, "danger");
+  }
+}
+function roleLabel(role) {
+  return { ADMIN: "Administrateur", GERANT: "Gérant", CAISSIER: "Caissier" }[role] || role;
+}
+
+/* ============================================================
+   PERMISSIONS — contrôle d'accès par menu, par utilisateur
+   ============================================================ */
+// Liste des menus réels de l'application (correspond 1:1 aux pages existantes de NAV_SECTIONS).
+const PERMISSION_PAGES = [
+  { key: "dashboard", label: "Tableau de bord" }, { key: "caisse", label: "Caisse (POS)" },
+  { key: "ventes", label: "Ventes" }, { key: "rapports", label: "Rapports & Statistiques" },
+  { key: "produits", label: "Produits" }, { key: "categories", label: "Catégories" },
+  { key: "stock", label: "Stock" }, { key: "etiquettes", label: "Étiquettes QR Codes" },
+  { key: "clients", label: "Clients" }, { key: "fournisseurs", label: "Fournisseurs" },
+  { key: "utilisateurs", label: "Utilisateurs & Rôles" }, { key: "parametres", label: "Paramètres & Impression" },
+];
+// Pages que le Caissier ne doit JAMAIS pouvoir voir, quelle que soit la configuration donnée par l'admin.
+const HARD_BLOCKED_PAGES = { CAISSIER: ["rapports", "parametres", "utilisateurs"] };
+// Permissions par défaut à la création d'un compte, selon le rôle choisi.
+const DEFAULT_PERMISSIONS_BY_ROLE = {
+  ADMIN: PERMISSION_PAGES.map(p => p.key), // non utilisé en pratique : l'admin a toujours un accès total (voir canSeePage)
+  GERANT: ["dashboard", "caisse", "ventes", "produits", "categories", "stock", "etiquettes", "clients", "fournisseurs"],
+  CAISSIER: ["caisse", "clients"],
+};
+
+// L'administrateur a TOUJOURS un accès total et inconditionnel — jamais restreint, jamais configurable.
+// (Le backend applique exactement la même règle — voir backend/src/permissions.js — donc un appel direct
+// à l'API sans passer par ce menu est refusé de la même façon.)
+function canSeePage(user, page) {
+  if (user.role === "ADMIN") return true;
+  const blocked = HARD_BLOCKED_PAGES[user.role] || [];
+  if (blocked.includes(page)) return false; // verrouillé en dur, ignore toute permission enregistrée
+  return (user.permissions || []).includes(page);
+}
+// Bénéfices, marges et chiffre d'affaires globaux : jamais visibles pour un Caissier (même règle qu'une page,
+// mais s'applique DANS des pages déjà accessibles comme le Tableau de bord — donc vérifié séparément du menu).
+function canSeeFinancials(user) {
+  if (user.role === "ADMIN") return true;
+  if (user.role === "CAISSIER") return false; // jamais, non configurable — exigence de sécurité explicite
+  return (user.permissions || []).includes("financials");
+}
+async function handleLogin() {
+  const userId = document.getElementById("login-user").value;
+  const password = document.getElementById("login-password").value;
+  const selected = LOGIN_USERS_CACHE.find(u => u.id === userId);
+  const errEl = document.getElementById("login-error");
+  if (!selected) { errEl.textContent = "Compte introuvable."; errEl.classList.remove("hidden"); return; }
+  try {
+    CURRENT_USER = await Api.login(selected.email, password);
+    errEl.classList.add("hidden");
+    await showApp();
+  } catch (err) {
+    errEl.textContent = err.message || "Mot de passe incorrect.";
+    errEl.classList.remove("hidden");
+  }
+}
+function handleLogout() {
+  Api.logout();
+  CURRENT_USER = null;
+  CART = [];
+  document.getElementById("screen-app").classList.add("hidden");
+  document.getElementById("screen-login").classList.remove("hidden");
+  document.getElementById("login-password").value = "";
+  populateLoginUsers();
+}
+async function showApp() {
+  document.getElementById("screen-login").classList.add("hidden");
+  document.getElementById("screen-app").classList.remove("hidden");
+  document.getElementById("screen-app").classList.add("flex");
+  document.getElementById("topbar-username").textContent = CURRENT_USER.name;
+  document.getElementById("topbar-userrole").textContent = roleLabel(CURRENT_USER.role);
+  document.getElementById("topbar-avatar").textContent = CURRENT_USER.name.charAt(0).toUpperCase();
+  try {
+    await loadAllData();
+  } catch (err) {
+    toast(`Échec du chargement des données depuis le serveur (${err.message}).`, "danger");
+  }
+  applyCompanyBranding();
+  renderSidebar();
+  const firstAllowed = NAV_SECTIONS.flatMap(s => s.items).find(it => canSeePage(CURRENT_USER, it.page));
+  navigate(firstAllowed ? firstAllowed.page : "caisse");
+}
+
+/* ============================================================
+   NAVIGATION & SIDEBAR
+   ============================================================ */
+const NAV_SECTIONS = [
+  { label: "Opérations", items: [
+    { page: "dashboard", label: "Tableau de bord", icon: "📊" },
+    { page: "caisse", label: "Caisse", icon: "🧮" },
+    { page: "ventes", label: "Ventes", icon: "🧾" },
+    { page: "rapports", label: "Rapports & Analyses", icon: "📈" },
+  ]},
+  { label: "Catalogue", items: [
+    { page: "produits", label: "Produits", icon: "📦" },
+    { page: "categories", label: "Catégories", icon: "🏷️" },
+    { page: "stock", label: "Stock", icon: "🗃️" },
+    { page: "etiquettes", label: "Étiquettes QR", icon: "🔖" },
+  ]},
+  { label: "Partenaires", items: [
+    { page: "clients", label: "Clients", icon: "👥" },
+    { page: "fournisseurs", label: "Fournisseurs", icon: "🚚" },
+  ]},
+  { label: "Administration", items: [
+    { page: "utilisateurs", label: "Utilisateurs", icon: "🧑‍💼" },
+    { page: "parametres", label: "Paramètres", icon: "⚙️" },
+  ]},
+];
+const PAGE_TITLES = {
+  dashboard: "Tableau de bord", caisse: "Caisse", ventes: "Historique des ventes", rapports: "Rapports & Analyses",
+  produits: "Produits", categories: "Catégories", stock: "Stock", etiquettes: "Étiquettes QR",
+  clients: "Clients", fournisseurs: "Fournisseurs", utilisateurs: "Utilisateurs",
+  parametres: "Paramètres de l'entreprise",
+};
+
+function renderSidebar() {
+  const nav = document.getElementById("nav-container");
+  nav.innerHTML = "";
+  NAV_SECTIONS.forEach(section => {
+    const items = section.items.filter(it => canSeePage(CURRENT_USER, it.page));
+    if (items.length === 0) return;
+    const wrap = document.createElement("div");
+    wrap.innerHTML = `<p class="px-3 mb-2 text-[11px] font-semibold uppercase tracking-wider text-white/35">${section.label}</p>
+      <div class="space-y-0.5">${items.map(it => `
+        <a href="#" data-page="${it.page}" class="nav-link flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors relative text-white/60 hover:text-white hover:bg-white/[0.05]">
+          <span>${it.icon}</span> ${it.label}
+        </a>`).join("")}</div>`;
+    nav.appendChild(wrap);
+  });
+  nav.querySelectorAll(".nav-link").forEach(a => {
+    a.addEventListener("click", (e) => { e.preventDefault(); navigate(a.dataset.page); closeMobileSidebar(); });
+  });
+}
+
+// ---- Menu responsive (mobile/tablette) : tiroir latéral avec animation, overlay, fermeture au clic dehors ----
+function openMobileSidebar() {
+  document.getElementById("sidebar").classList.remove("-translate-x-full");
+  const bd = document.getElementById("sidebar-backdrop");
+  bd.classList.remove("hidden");
+  requestAnimationFrame(() => bd.classList.remove("opacity-0"));
+}
+function closeMobileSidebar() {
+  document.getElementById("sidebar").classList.add("-translate-x-full");
+  const bd = document.getElementById("sidebar-backdrop");
+  bd.classList.add("opacity-0");
+  setTimeout(() => bd.classList.add("hidden"), 200);
+}
+function setupMobileSidebarToggles() {
+  document.getElementById("btn-open-sidebar").addEventListener("click", openMobileSidebar);
+  document.getElementById("btn-close-sidebar").addEventListener("click", closeMobileSidebar);
+  document.getElementById("sidebar-backdrop").addEventListener("click", closeMobileSidebar);
+  window.addEventListener("resize", () => { if (window.innerWidth >= 1024) closeMobileSidebar(); });
+}
+function navigate(page) {
+  ACTIVE_PAGE = page;
+  document.getElementById("page-title").textContent = PAGE_TITLES[page];
+  document.querySelectorAll(".nav-link").forEach(a => {
+    a.classList.toggle("bg-white/[0.08]", a.dataset.page === page);
+    a.classList.toggle("text-white", a.dataset.page === page);
+    a.classList.toggle("font-medium", a.dataset.page === page);
+  });
+  const renderers = {
+    dashboard: renderDashboard, caisse: renderCaisse, ventes: renderVentes, rapports: renderRapports,
+    produits: renderProduits, categories: renderCategories, stock: renderStock, etiquettes: renderEtiquettesQR,
+    clients: renderClients, fournisseurs: renderFournisseurs, utilisateurs: renderUtilisateurs, parametres: renderParametres,
+  };
+  document.getElementById("page-root").innerHTML = "";
+  if (!canSeePage(CURRENT_USER, page)) {
+    document.getElementById("page-root").innerHTML = `<div class="card p-8 text-center text-sm text-ink-400">🔒 Accès réservé — ce menu n'est pas autorisé pour ton compte.</div>`;
+    return;
+  }
+  renderers[page]();
+}
+</script>
+<script>
+/* ============================================================
+   TABLEAU DE BORD
+   ============================================================ */
+function computeSummary() {
+  const start = todayStart();
+  const todaySales = DB.sales.filter(s => new Date(s.createdAt) >= start && s.status === "VALIDEE");
+  const revenueToday = todaySales.reduce((s, sale) => s + sale.total, 0);
+  const profitToday = todaySales.reduce((sum, sale) => {
+    const p = sale.items.reduce((acc, item) => {
+      const product = DB.products.find(pr => pr.id === item.productId);
+      const cost = (product?.purchasePrice ?? 0) * item.quantity;
+      return acc + (item.subtotal - cost);
+    }, 0);
+    return sum + p;
+  }, 0);
+  const lowStock = DB.products.filter(p => p.isActive && p.quantity <= p.lowStockThreshold);
+  const expired = DB.products.filter(p => p.isActive && p.expirationDate && new Date(p.expirationDate) < new Date());
+
+  const salesByProduct = {};
+  DB.sales.forEach(sale => sale.items.forEach(item => {
+    if (!salesByProduct[item.productId]) salesByProduct[item.productId] = { name: item.productName, qty: 0, revenue: 0 };
+    salesByProduct[item.productId].qty += item.quantity;
+    salesByProduct[item.productId].revenue += item.subtotal;
+  }));
+  const topProducts = Object.values(salesByProduct).sort((a, b) => b.qty - a.qty).slice(0, 5);
+
+  return { revenueToday, salesCountToday: todaySales.length, profitToday, lowStock, expired, topProducts };
+}
+
+function renderDashboard() {
+  const s = computeSummary();
+  const root = document.getElementById("page-root");
+  const showFinancials = canSeeFinancials(CURRENT_USER);
+  const lockedCard = (label) => `<div class="card p-5 flex items-start justify-between"><div><p class="text-xs font-medium text-ink-600 mb-2">${label}</p><p class="font-mono font-semibold text-lg text-ink-400">🔒 Masqué</p></div></div>`;
+  root.innerHTML = `
+    <div class="space-y-6">
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        ${showFinancials ? `
+        <div class="card p-5 flex items-start justify-between">
+          <div><p class="text-xs font-medium text-ink-600 mb-2">Chiffre d'affaires du jour</p><p class="font-mono font-semibold text-2xl">${fmtGNF(s.revenueToday)}</p></div>
+          <div class="w-10 h-10 rounded-lg bg-navy-50 text-navy-700 flex items-center justify-center">💰</div>
+        </div>` : lockedCard("Chiffre d'affaires du jour")}
+        <div class="card p-5 flex items-start justify-between">
+          <div><p class="text-xs font-medium text-ink-600 mb-2">Ventes du jour</p><p class="font-mono font-semibold text-2xl">${s.salesCountToday}</p><p class="text-xs text-ink-400 mt-1.5">transactions</p></div>
+          <div class="w-10 h-10 rounded-lg bg-navy-50 text-navy-700 flex items-center justify-center">🧾</div>
+        </div>
+        ${showFinancials ? `
+        <div class="card p-5 flex items-start justify-between">
+          <div><p class="text-xs font-medium text-ink-600 mb-2">Bénéfice du jour</p><p class="font-mono font-semibold text-2xl">${fmtGNF(s.profitToday)}</p></div>
+          <div class="w-10 h-10 rounded-lg bg-accent-50 text-accent-600 flex items-center justify-center">📈</div>
+        </div>` : lockedCard("Bénéfice du jour")}
+        <div class="card p-5 flex items-start justify-between">
+          <div><p class="text-xs font-medium text-ink-600 mb-2">Stock faible</p><p class="font-mono font-semibold text-2xl">${s.lowStock.length}</p><p class="text-xs text-ink-400 mt-1.5">${s.expired.length} produit(s) périmé(s)</p></div>
+          <div class="w-10 h-10 rounded-lg ${s.lowStock.length ? 'bg-warning/10 text-warning' : 'bg-navy-50 text-navy-700'} flex items-center justify-center">⚠️</div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
+        <div class="card p-5 xl:col-span-2">
+          <h2 class="font-display font-semibold text-sm mb-4">Chiffre d'affaires — 7 derniers jours</h2>
+          ${showFinancials ? `<canvas id="trendChart" height="90"></canvas>` : `<p class="text-sm text-ink-400 py-10 text-center">🔒 Données financières masquées pour ce compte.</p>`}
+        </div>
+        <div class="card p-5">
+          <div class="flex items-center gap-2 mb-4"><span class="text-accent-600">🏆</span><h2 class="font-display font-semibold text-sm">Meilleures ventes</h2></div>
+          ${s.topProducts.length === 0 ? `<p class="text-sm text-ink-400">Aucune vente enregistrée.</p>` : `
+          <ul class="space-y-3 text-sm">${s.topProducts.map((p, i) => `
+            <li class="flex items-center justify-between">
+              <div class="flex items-center gap-2.5 min-w-0"><span class="w-5 h-5 rounded bg-navy-50 text-navy-700 text-[11px] font-mono font-semibold flex items-center justify-center shrink-0">${i+1}</span><span class="truncate">${p.name}</span></div>
+              <span class="font-mono text-ink-600 shrink-0 ml-2">${p.qty}</span>
+            </li>`).join("")}</ul>`}
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="card p-5">
+          <div class="flex items-center gap-2 mb-4"><span class="text-warning">⚠️</span><h2 class="font-display font-semibold text-sm">Stock faible</h2></div>
+          ${s.lowStock.length === 0 ? `<p class="text-sm text-ink-400">Tous les stocks sont à un niveau correct.</p>` : `
+          <ul class="divide-y divide-border text-sm">${s.lowStock.map(p => `<li class="flex items-center justify-between py-2.5"><span>${p.name}</span><span class="font-mono text-warning">${p.quantity} ${p.unit}</span></li>`).join("")}</ul>`}
+        </div>
+        <div class="card p-5">
+          <div class="flex items-center gap-2 mb-4"><span class="text-danger">⏰</span><h2 class="font-display font-semibold text-sm">Produits périmés</h2></div>
+          ${s.expired.length === 0 ? `<p class="text-sm text-ink-400">Aucun produit périmé détecté.</p>` : `
+          <ul class="divide-y divide-border text-sm">${s.expired.map(p => `<li class="flex items-center justify-between py-2.5"><span>${p.name}</span><span class="font-mono text-danger">${fmtDate(p.expirationDate)}</span></li>`).join("")}</ul>`}
+        </div>
+      </div>
+    </div>`;
+
+  if (!showFinancials) return; // pas de graphique financier à initialiser pour ce compte
+  const labels = []; const values = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400000);
+    const key = d.toDateString();
+    labels.push(d.toLocaleDateString("fr-FR", { day: "2-digit", month: "short" }));
+    const total = DB.sales.filter(s2 => new Date(s2.createdAt).toDateString() === key).reduce((sum, s2) => sum + s2.total, 0);
+    values.push(total);
+  }
+  if (window._chart) { window._chart.destroy(); }
+  window._chart = new Chart(document.getElementById("trendChart"), {
+    type: "line",
+    data: { labels, datasets: [{ data: values, borderColor: "#1E3A5F", backgroundColor: "rgba(30,58,95,0.12)", fill: true, tension: 0.35, pointRadius: 0, borderWidth: 2 }] },
+    options: {
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => fmtGNF(c.parsed.y) } } },
+      scales: { x: { grid: { display: false }, ticks: { color: "#98A2B3", font: { size: 11 } } }, y: { grid: { color: "#E6EAF2" }, ticks: { color: "#98A2B3", font: { size: 11 } } } }
+    }
+  });
+}
+
+/* ============================================================
+   CATÉGORIES
+   ============================================================ */
+function renderCategories() {
+  const root = document.getElementById("page-root");
+  const canEdit = CURRENT_USER.role !== "CAISSIER";
+  root.innerHTML = `
+    <div class="card">
+      <div class="flex items-center justify-between p-5 border-b border-border">
+        <h2 class="font-display font-semibold text-base">Catégories (${DB.categories.length})</h2>
+        ${canEdit ? `<button class="btn-primary" onclick="openCategoryForm()">+ Nouvelle catégorie</button>` : ""}
+      </div>
+      <table class="data w-full">
+        <thead><tr><th>Nom</th><th>Description</th><th>Produits</th><th></th></tr></thead>
+        <tbody>${DB.categories.map(c => {
+          const count = DB.products.filter(p => p.categoryId === c.id && p.isActive).length;
+          return `<tr>
+            <td class="font-medium">${c.name}</td>
+            <td class="text-ink-600">${c.description || "—"}</td>
+            <td class="font-mono">${count}</td>
+            <td class="text-right">${canEdit ? `
+              <button class="btn-ghost !px-2 !py-1" onclick='openCategoryForm(${JSON.stringify(c.id)})'>Modifier</button>
+              <button class="btn-danger !px-2 !py-1" onclick="deleteCategory('${c.id}')">Supprimer</button>` : ""}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>
+    </div>`;
+}
+function openCategoryForm(id) {
+  const cat = id ? DB.categories.find(c => c.id === id) : null;
+  openModal(cat ? "Modifier la catégorie" : "Nouvelle catégorie", `
+    <div class="space-y-4">
+      <div><label class="label">Nom</label><input id="f-name" class="input" value="${cat?.name || ""}" /></div>
+      <div><label class="label">Description</label><input id="f-desc" class="input" value="${cat?.description || ""}" /></div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+        <button class="btn-primary" onclick="saveCategory(${id ? `'${id}'` : "null"})">Enregistrer</button>
+      </div>
+    </div>`);
+}
+async function saveCategory(id) {
+  const name = document.getElementById("f-name").value.trim();
+  const description = document.getElementById("f-desc").value.trim();
+  if (!name) return toast("Le nom est requis.", "danger");
+  try {
+    if (id) await Api.categories.update(id, { name, description });
+    else await Api.categories.create({ name, description });
+    DB.categories = await Api.categories.list();
+    closeModal(); toast("Catégorie enregistrée."); renderCategories();
+  } catch (err) { toast(err.message, "danger"); }
+}
+async function deleteCategory(id) {
+  const count = DB.products.filter(p => p.categoryId === id && p.isActive).length;
+  if (count > 0) return toast(`Impossible : ${count} produit(s) rattaché(s).`, "danger");
+  if (!confirm("Supprimer cette catégorie ?")) return;
+  try {
+    await Api.categories.remove(id);
+    DB.categories = await Api.categories.list();
+    toast("Catégorie supprimée."); renderCategories();
+  } catch (err) { toast(err.message, "danger"); }
+}
+</script>
+<script>
+/* ============================================================
+   PRODUITS
+   ============================================================ */
+let PRODUCT_SEARCH = "";
+function renderProduits() {
+  const root = document.getElementById("page-root");
+  const canEdit = CURRENT_USER.role !== "CAISSIER";
+  const list = DB.products.filter(p => p.isActive && p.name.toLowerCase().includes(PRODUCT_SEARCH.toLowerCase()));
+  root.innerHTML = `
+    <div class="card">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-5 border-b border-border">
+        <h2 class="font-display font-semibold text-base">Produits (${list.length})</h2>
+        <div class="flex items-center gap-2">
+          <input id="product-search" class="input sm:w-64" placeholder="Rechercher un produit..." value="${PRODUCT_SEARCH}" />
+          ${canEdit ? `<button class="btn-primary whitespace-nowrap" onclick="openProductForm()">+ Nouveau produit</button>` : ""}
+        </div>
+      </div>
+      <table class="data w-full">
+        <thead><tr><th>Image</th><th>QR</th><th>Nom</th><th>Catégorie</th><th>Achat</th><th>Vente</th><th>Stock</th><th></th></tr></thead>
+        <tbody>${list.map(p => {
+          const cat = DB.categories.find(c => c.id === p.categoryId);
+          const low = p.quantity <= p.lowStockThreshold;
+          const expired = p.expirationDate && new Date(p.expirationDate) < new Date();
+          return `<tr>
+            <td><img src="${p.imageUrl || DEFAULT_PRODUCT_IMAGE}" class="w-9 h-9 rounded object-cover border border-border" /></td>
+            <td><canvas class="qr-thumb" data-qr="${p.qrCode}" width="36" height="36"></canvas></td>
+            <td><p class="font-medium">${p.name}</p><p class="text-xs text-ink-400 font-mono">${p.qrCode}</p></td>
+            <td class="text-ink-600">${cat?.name || "—"}</td>
+            <td class="font-mono text-ink-600">${fmtGNF(p.purchasePrice)}</td>
+            <td class="font-mono">${fmtGNF(p.sellingPrice)}</td>
+            <td class="font-mono ${low ? "text-warning font-semibold" : ""}">${p.quantity} ${p.unit} ${expired ? '<span class="text-danger">· périmé</span>' : ""}</td>
+            <td class="text-right whitespace-nowrap">
+              <button class="btn-ghost !px-2 !py-1" onclick="printLabel('${p.id}')">Étiquette</button>
+              ${canEdit ? `<button class="btn-ghost !px-2 !py-1" onclick='openProductForm(${JSON.stringify(p.id)})'>Modifier</button>
+              <button class="btn-danger !px-2 !py-1" onclick="deleteProduct('${p.id}')">Supprimer</button>` : ""}
+            </td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>
+    </div>`;
+  document.getElementById("product-search").addEventListener("input", (e) => { PRODUCT_SEARCH = e.target.value; renderProduits(); });
+  document.getElementById("product-search").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const code = extractQrCode(PRODUCT_SEARCH);
+    const match = DB.products.find(p => p.isActive && (p.qrCode.toLowerCase() === code.toLowerCase() || (p.barcode && p.barcode.toLowerCase() === code.toLowerCase())));
+    if (match) {
+      PRODUCT_SEARCH = ""; renderProduits();
+      openProductForm(match.id); // "Ouverture automatique de la fiche produit" après un scan (douchette USB/Bluetooth ou saisie manuelle du code)
+    }
+  });
+  document.querySelectorAll(".qr-thumb").forEach(c => QRCode.toCanvas(c, c.dataset.qr, { width: 36, margin: 2 }));
+}
+
+let PRODUCT_IMAGE_PREVIEW = null; // Base64 temporaire pendant l'édition, avant enregistrement
+
+function openProductForm(id) {
+  const p = id ? DB.products.find(x => x.id === id) : null;
+  PRODUCT_IMAGE_PREVIEW = p?.imageUrl || null;
+  const catOptions = DB.categories.map(c => `<option value="${c.id}" ${p?.categoryId === c.id ? "selected" : ""}>${c.name}</option>`).join("");
+  openModal(p ? "Modifier le produit" : "Nouveau produit", `
+    <div class="flex items-center gap-4 mb-4">
+      <div id="product-image-preview" class="w-20 h-20 rounded-lg border border-border overflow-hidden shrink-0 bg-navy-50">
+        <img src="${p?.imageUrl || DEFAULT_PRODUCT_IMAGE}" class="w-full h-full object-cover" />
+      </div>
+      <div>
+        <label class="label">Image du produit</label>
+        <input id="f-image" type="file" accept="image/*" class="text-sm" />
+        <button type="button" class="text-xs text-danger hover:underline mt-1.5 block" onclick="clearProductImage()">Supprimer l'image</button>
+      </div>
+    </div>
+    <div class="grid grid-cols-2 gap-4">
+      <div class="col-span-2"><label class="label">Nom du produit</label><input id="f-name" class="input" value="${p?.name || ""}" /></div>
+      <div><label class="label">Marque</label><input id="f-brand" class="input" value="${p?.brand || ""}" /></div>
+      <div><label class="label">Catégorie</label><select id="f-cat" class="input">${catOptions}</select></div>
+      <div><label class="label">Prix d'achat (GNF)</label><input id="f-purchase" type="number" class="input" value="${p?.purchasePrice ?? ""}" /></div>
+      <div><label class="label">Prix de vente (GNF)</label><input id="f-sell" type="number" class="input" value="${p?.sellingPrice ?? ""}" /></div>
+      <div><label class="label">Quantité en stock</label><input id="f-qty" type="number" class="input" value="${p?.quantity ?? 0}" /></div>
+      <div><label class="label">Unité</label><input id="f-unit" class="input" value="${p?.unit || "unité"}" /></div>
+      <div><label class="label">Seuil de stock faible</label><input id="f-threshold" type="number" class="input" value="${p?.lowStockThreshold ?? 5}" /></div>
+      <div><label class="label">Date d'expiration (optionnel)</label><input id="f-exp" type="date" class="input" value="${p?.expirationDate ? p.expirationDate.slice(0,10) : ""}" /></div>
+    </div>
+    ${p ? `<p class="text-xs text-ink-400 font-mono mt-3">Code QR : ${p.qrCode} (généré automatiquement, non modifiable)</p>` : `<p class="text-xs text-ink-400 mt-3">Un code QR unique sera généré automatiquement à la création.</p>`}
+    <div class="flex justify-end gap-2 pt-4">
+      <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+      <button class="btn-primary" onclick="saveProduct(${id ? `'${id}'` : "null"})">Enregistrer</button>
+    </div>`, { size: "max-w-xl" });
+
+  document.getElementById("f-image").addEventListener("change", (e) => {
+    fileToBase64(e.target.files[0], (base64) => {
+      if (!base64) return;
+      PRODUCT_IMAGE_PREVIEW = base64;
+      document.getElementById("product-image-preview").innerHTML = `<img src="${base64}" class="w-full h-full object-cover" />`;
+    });
+  });
+}
+function clearProductImage() {
+  PRODUCT_IMAGE_PREVIEW = null;
+  const preview = document.getElementById("product-image-preview");
+  if (preview) preview.innerHTML = `<img src="${DEFAULT_PRODUCT_IMAGE}" class="w-full h-full object-cover" />`;
+  const input = document.getElementById("f-image");
+  if (input) input.value = "";
+}
+async function saveProduct(id) {
+  const name = document.getElementById("f-name").value.trim();
+  const categoryId = document.getElementById("f-cat").value;
+  const purchasePrice = Number(document.getElementById("f-purchase").value);
+  const sellingPrice = Number(document.getElementById("f-sell").value);
+  const quantity = Number(document.getElementById("f-qty").value);
+  const unit = document.getElementById("f-unit").value.trim() || "unité";
+  const lowStockThreshold = Number(document.getElementById("f-threshold").value);
+  const expRaw = document.getElementById("f-exp").value;
+  const brand = document.getElementById("f-brand").value.trim();
+
+  if (!name) return toast("Le nom est requis.", "danger");
+  if (!categoryId) return toast("La catégorie est requise.", "danger");
+  if (isNaN(purchasePrice) || isNaN(sellingPrice)) return toast("Prix invalides.", "danger");
+
+  try {
+    if (id) {
+      const p = DB.products.find(x => x.id === id);
+      await Api.products.update(id, { name, brand, categoryId, purchasePrice, sellingPrice, quantity, unit,
+        lowStockThreshold, expirationDate: expRaw ? new Date(expRaw).toISOString() : null, imageUrl: PRODUCT_IMAGE_PREVIEW,
+        barcode: p.barcode, isActive: p.isActive });
+    } else {
+      await Api.products.create({ name, brand, categoryId, purchasePrice, sellingPrice, quantity, unit,
+        lowStockThreshold, expirationDate: expRaw ? new Date(expRaw).toISOString() : null, imageUrl: PRODUCT_IMAGE_PREVIEW,
+        qrCode: genQrValue(), barcode: null, isActive: true });
+    }
+    DB.products = await Api.products.list();
+    closeModal(); toast("Produit enregistré."); renderProduits();
+  } catch (err) { toast(err.message, "danger"); }
+}
+async function deleteProduct(id) {
+  if (!confirm("Supprimer ce produit ? Il ne sera plus visible dans le catalogue.")) return;
+  try {
+    await Api.products.remove(id);
+    DB.products = await Api.products.list();
+    toast("Produit supprimé."); renderProduits();
+  } catch (err) { toast(err.message, "danger"); }
+}
+// L'impression d'étiquette individuelle réutilise le générateur du module "ÉTIQUETTES QR EN LOT" ci-dessous.
+</script>
+<script>
+/* ============================================================
+   ÉTIQUETTES — sélection multiple, formats standards, options d'affichage,
+   aperçu, impression (A4 grille ou rouleau thermique continu) et export PDF
+   réel (jsPDF pur, sans html2canvas — QR/codes-barres pré-générés via Promise.all)
+   ============================================================ */
+let QR_LABELS_SEARCH = "";
+let QR_LABELS_SELECTED = {}; // { [productId]: quantité d'étiquettes à imprimer }
+let QR_LABEL_FORMAT_KEY = "50x30";
+let QR_PRINT_MODE = "a4"; // "a4" (grille A4) | "thermal" (rouleau continu 58/80mm)
+let QR_LABEL_OPTIONS = { name: true, price: true, currency: true, qr: true, sku: true, barcode: false };
+
+const LABEL_FORMATS = {
+  "40x25": { w: 40, h: 25, label: "40 × 25 mm" },
+  "50x30": { w: 50, h: 30, label: "50 × 30 mm" },
+  "58x40": { w: 58, h: 40, label: "58 × 40 mm" },
+  "60x40": { w: 60, h: 40, label: "60 × 40 mm" },
+  "80x50": { w: 80, h: 50, label: "80 × 50 mm" },
+};
+const A4_W_MM = 210, A4_H_MM = 297, PAGE_MARGIN_MM = 8, LABEL_GAP_MM = 2;
+
+// Affiche une erreur à l'écran (toast) ET dans la console avec le détail complet, pour ne jamais échouer "en silence"
+function reportError(context, err) {
+  console.error(`[Étiquettes] ${context} :`, err);
+  toast(`Erreur — ${context} : ${err && err.message ? err.message : err}`, "danger");
+}
+
+// Vérifie que toutes les bibliothèques nécessaires sont bien chargées AVANT de lancer une impression/génération
+function checkLabelLibraries() {
+  const missing = [];
+  if (typeof QRCode === "undefined") missing.push("QRCode.js (génération des QR codes)");
+  if (!window.jspdf || !window.jspdf.jsPDF) missing.push("jsPDF (génération du PDF)");
+  if (QR_LABEL_OPTIONS.barcode && typeof JsBarcode === "undefined") missing.push("JsBarcode (génération des codes-barres)");
+  if (missing.length) {
+    reportError("bibliothèques manquantes", `Non chargée(s) : ${missing.join(", ")}. Vérifie la connexion internet puis recharge la page.`);
+    return false;
+  }
+  return true;
+}
+
+function filteredQrProducts() {
+  return DB.products.filter(p => p.isActive && p.name.toLowerCase().includes(QR_LABELS_SEARCH.toLowerCase()));
+}
+
+function gridColumns(format) {
+  const usableW = A4_W_MM - PAGE_MARGIN_MM * 2;
+  return Math.max(1, Math.floor((usableW + LABEL_GAP_MM) / (format.w + LABEL_GAP_MM)));
+}
+function gridRows(format) {
+  const usableH = A4_H_MM - PAGE_MARGIN_MM * 2;
+  return Math.max(1, Math.floor((usableH + LABEL_GAP_MM) / (format.h + LABEL_GAP_MM)));
+}
+function labelsPerPage(format) {
+  return gridColumns(format) * gridRows(format);
+}
+
+function renderEtiquettesQR() {
+  const root = document.getElementById("page-root");
+  const filtered = filteredQrProducts();
+  const selectedCount = Object.keys(QR_LABELS_SELECTED).length;
+  const totalLabels = Object.values(QR_LABELS_SELECTED).reduce((s, q) => s + q, 0);
+  const allFilteredSelected = filtered.length > 0 && filtered.every(p => QR_LABELS_SELECTED[p.id] != null);
+  const format = LABEL_FORMATS[QR_LABEL_FORMAT_KEY];
+  const perPage = labelsPerPage(format);
+  const o = QR_LABEL_OPTIONS;
+
+  root.innerHTML = `
+    <div class="space-y-4">
+      <div class="card p-4">
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3">
+          <input id="qr-search" class="input sm:max-w-xs" placeholder="Rechercher un produit..." value="${QR_LABELS_SEARCH}" />
+          <label class="flex items-center gap-2 text-sm shrink-0">
+            <input type="checkbox" ${allFilteredSelected ? "checked" : ""} onchange="toggleSelectAllFiltered(this.checked)" />
+            Tous les produits (${filtered.length})
+          </label>
+          <div class="flex flex-wrap gap-2 sm:ml-auto">
+            <button class="btn-ghost !px-2 !py-1 text-xs" onclick="quickSelect(1)">1 produit</button>
+            <button class="btn-ghost !px-2 !py-1 text-xs" onclick="quickSelect(2)">2 produits</button>
+            <button class="btn-ghost !px-2 !py-1 text-xs" onclick="quickSelect(4)">4 produits</button>
+            <button class="btn-ghost !px-2 !py-1 text-xs" onclick="quickSelect(10)">10 produits</button>
+            <button class="btn-ghost !px-2 !py-1 text-xs" onclick="quickSelect(Infinity)">Tous</button>
+            <button class="btn-ghost !px-2 !py-1 text-xs" onclick="toggleSelectAllFiltered(false)">Désélectionner tout</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card p-4">
+        <h2 class="font-display font-semibold text-sm mb-3">Mise en page de l'étiquette</h2>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <div>
+            <label class="label">Format d'étiquette</label>
+            <select id="qr-format" class="input">
+              ${Object.entries(LABEL_FORMATS).map(([key, f]) => `<option value="${key}" ${key === QR_LABEL_FORMAT_KEY ? "selected" : ""}>${f.label}</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label class="label">Mode d'impression</label>
+            <select id="qr-print-mode" class="input">
+              <option value="a4" ${QR_PRINT_MODE === "a4" ? "selected" : ""}>Feuille A4 (grille)</option>
+              <option value="thermal" ${QR_PRINT_MODE === "thermal" ? "selected" : ""}>Imprimante thermique (rouleau continu)</option>
+            </select>
+          </div>
+          <div class="col-span-2">
+            <label class="label">Informations affichées sur l'étiquette</label>
+            <div class="flex flex-wrap gap-x-4 gap-y-1.5 text-sm pt-1.5">
+              <label class="flex items-center gap-1.5"><input type="checkbox" ${o.name ? "checked" : ""} onchange="setLabelOption('name', this.checked)" /> Nom</label>
+              <label class="flex items-center gap-1.5"><input type="checkbox" ${o.price ? "checked" : ""} onchange="setLabelOption('price', this.checked)" /> Prix</label>
+              <label class="flex items-center gap-1.5"><input type="checkbox" ${o.currency ? "checked" : ""} onchange="setLabelOption('currency', this.checked)" /> Devise</label>
+              <label class="flex items-center gap-1.5"><input type="checkbox" ${o.qr ? "checked" : ""} onchange="setLabelOption('qr', this.checked)" /> QR Code</label>
+              <label class="flex items-center gap-1.5"><input type="checkbox" ${o.sku ? "checked" : ""} onchange="setLabelOption('sku', this.checked)" /> Code produit (SKU)</label>
+              <label class="flex items-center gap-1.5"><input type="checkbox" ${o.barcode ? "checked" : ""} onchange="setLabelOption('barcode', this.checked)" /> Code-barres</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="p-4 border-b border-border">
+          <h2 class="font-display font-semibold text-sm">Sélection des produits (${selectedCount} sélectionné(s) · ${totalLabels} étiquette(s) au total${QR_PRINT_MODE === "a4" && totalLabels > 0 ? ` · ${Math.ceil(totalLabels / perPage)} page(s) A4` : ""})</h2>
+        </div>
+        <div class="max-h-96 overflow-y-auto divide-y divide-border">
+          ${filtered.map(p => {
+            const checked = QR_LABELS_SELECTED[p.id] != null;
+            const qty = QR_LABELS_SELECTED[p.id] ?? 1;
+            return `<div class="flex items-center gap-3 px-4 py-2.5">
+              <input type="checkbox" ${checked ? "checked" : ""} onchange="toggleProductSelection('${p.id}', this.checked)" />
+              <div class="min-w-0 flex-1"><p class="text-sm font-medium truncate">${p.name}</p><p class="text-xs text-ink-400 font-mono">${fmtGNF(p.sellingPrice)} · ${p.qrCode}</p></div>
+              <div class="shrink-0 flex items-center gap-1.5">
+                <label class="text-xs text-ink-400">Étiquettes</label>
+                <input type="number" min="1" class="input !w-20 !py-1" value="${qty}" ${checked ? "" : "disabled"} onchange="setLabelQuantity('${p.id}', this.value)" />
+              </div>
+            </div>`;
+          }).join("") || `<p class="text-sm text-ink-400 text-center py-8">Aucun produit trouvé.</p>`}
+        </div>
+      </div>
+
+      <div class="card p-4 flex flex-wrap items-center justify-between gap-3">
+        <p class="text-sm text-ink-600">${format.label} · ${QR_PRINT_MODE === "a4" ? `A4 portrait, ${gridColumns(format)} colonne(s) × ${gridRows(format)} ligne(s) par page` : "rouleau thermique continu (XPrinter / Epson / Sunmi / POS58 / POS80)"}</p>
+        <div class="flex gap-2">
+          <button id="btn-labels-preview" class="btn-ghost" onclick="generateLabelsPreview()">Aperçu avant impression</button>
+          <button id="btn-labels-print" class="btn-accent" onclick="printLabelsA4()">🖨️ Imprimer</button>
+          <button id="btn-labels-pdf" class="btn-primary" onclick="downloadLabelsPdf()">⬇️ Télécharger en PDF</button>
+        </div>
+      </div>
+
+      <div id="labels-preview-wrap"></div>
+    </div>`;
+
+  document.getElementById("qr-search").addEventListener("input", (e) => { QR_LABELS_SEARCH = e.target.value; renderEtiquettesQR(); });
+  document.getElementById("qr-format").addEventListener("change", (e) => { QR_LABEL_FORMAT_KEY = e.target.value; renderEtiquettesQR(); });
+  document.getElementById("qr-print-mode").addEventListener("change", (e) => { QR_PRINT_MODE = e.target.value; renderEtiquettesQR(); });
+}
+
+function setLabelOption(key, value) {
+  QR_LABEL_OPTIONS[key] = value;
+}
+function toggleProductSelection(id, checked) {
+  if (checked) QR_LABELS_SELECTED[id] = QR_LABELS_SELECTED[id] || 1;
+  else delete QR_LABELS_SELECTED[id];
+  renderEtiquettesQR();
+}
+function setLabelQuantity(id, value) {
+  const qty = Math.max(1, Number(value) || 1);
+  if (QR_LABELS_SELECTED[id] != null) QR_LABELS_SELECTED[id] = qty;
+}
+function toggleSelectAllFiltered(checked) {
+  const list = filteredQrProducts();
+  if (checked) list.forEach(p => { QR_LABELS_SELECTED[p.id] = QR_LABELS_SELECTED[p.id] || 1; });
+  else list.forEach(p => { delete QR_LABELS_SELECTED[p.id]; });
+  renderEtiquettesQR();
+}
+function quickSelect(n) {
+  const list = filteredQrProducts();
+  QR_LABELS_SELECTED = {};
+  list.slice(0, n === Infinity ? list.length : n).forEach(p => { QR_LABELS_SELECTED[p.id] = 1; });
+  renderEtiquettesQR();
+}
+
+// Le QR produit contient STRICTEMENT le code produit (SKU) — rien d'autre, aucun JSON, aucun champ additionnel.
+// Garantit un contenu identique à l'écran et sur l'étiquette : DB.products[].qrCode === contenu du QR, point final.
+function buildQrPayload(p) {
+  return p.qrCode;
+}
+
+function fmtNumberOnly(v) {
+  return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 0 }).format(v || 0);
+}
+
+// Génère le QR d'un produit en Canvas réel (jamais de simple "image" simulée), avec détail d'erreur complet en console.
+// Le code produit (quelques caractères) tient toujours très largement en version 1 — pas de repli nécessaire.
+async function generateProductQr(p) {
+  try {
+    const canvas = document.createElement("canvas");
+    await QRCode.toCanvas(canvas, buildQrPayload(p), { width: 300, margin: 4, errorCorrectionLevel: "M" });
+    return canvas.toDataURL("image/png");
+  } catch (err) {
+    console.error(`[Étiquettes] Échec de génération du QR pour "${p.name}" (id=${p.id}, code=${p.qrCode}) — vérifie que le moteur QR interne est bien chargé :`, err);
+    return null;
+  }
+}
+
+// Génère le code-barres (CODE128) d'un produit en Canvas réel, avec détail d'erreur complet en console
+function generateProductBarcode(p) {
+  if (typeof JsBarcode === "undefined") {
+    console.error(`[Étiquettes] JsBarcode n'est pas chargé — impossible de générer le code-barres de "${p.name}".`);
+    return null;
+  }
+  const value = (p.barcode || p.qrCode || "").toString();
+  if (!value) return null;
+  try {
+    const canvas = document.createElement("canvas");
+    JsBarcode(canvas, value, { format: "CODE128", displayValue: false, margin: 0, height: 50, width: 2 });
+    return canvas.toDataURL("image/png");
+  } catch (err) {
+    console.error(`[Étiquettes] Échec génération code-barres pour "${p.name}" (valeur="${value}") :`, err);
+    return null;
+  }
+}
+
+// Construit la liste à plat des étiquettes à produire, avec QR/code-barres PRÉ-générés en parallèle (Promise.all)
+// AVANT toute création de PDF ou d'impression — jamais de génération "à la volée" pendant le rendu.
+async function buildLabelsData() {
+  const entries = Object.entries(QR_LABELS_SELECTED);
+  if (entries.length === 0) return [];
+  const uniqueProducts = entries.map(([id]) => DB.products.find(p => p.id === id)).filter(Boolean);
+  const t0 = performance.now();
+
+  const qrCache = {};
+  const barcodeCache = {};
+  let qrFailures = 0;
+
+  if (QR_LABEL_OPTIONS.qr) {
+    await Promise.all(uniqueProducts.map(async (p) => {
+      const dataUrl = await generateProductQr(p);
+      if (!dataUrl) qrFailures++;
+      qrCache[p.id] = dataUrl;
+    }));
+    const dt = (performance.now() - t0).toFixed(1);
+    console.log(`✔ QR générés : ${uniqueProducts.length - qrFailures}/${uniqueProducts.length} produit(s) uniques · ✔ Temps total : ${dt} ms · ✔ Échecs : ${qrFailures}`);
+  }
+  if (QR_LABEL_OPTIONS.barcode) {
+    uniqueProducts.forEach(p => { barcodeCache[p.id] = generateProductBarcode(p); });
+  }
+  if (qrFailures > 0) {
+    toast(`${qrFailures} QR code(s) n'ont pas pu être générés — voir la console (F12) pour le détail.`, "danger");
+  }
+
+  const items = [];
+  entries.forEach(([productId, qty]) => {
+    const p = DB.products.find(pr => pr.id === productId);
+    if (!p) return;
+    for (let i = 0; i < Math.max(1, Number(qty) || 1); i++) {
+      items.push({ product: p, qrDataUrl: qrCache[productId] || null, barcodeDataUrl: barcodeCache[productId] || null });
+    }
+  });
+  return items;
+}
+
+function paginateLabels(items, perPage) {
+  const pages = [];
+  for (let i = 0; i < items.length; i += perPage) pages.push(items.slice(i, i + perPage));
+  return pages.length ? pages : [[]];
+}
+
+// CSS de rendu HTML (aperçu + fenêtre d'impression) — dimensions dynamiques selon le format choisi
+function buildLabelCss(format, mode) {
+  const base = `
+    * { box-sizing: border-box; }
+    body { font-family: Arial, Helvetica, sans-serif; margin: 0; background: #fff; }
+    .label {
+      width: ${format.w}mm; height: ${format.h}mm;
+      border: 1px dashed #ccc; border-radius: 1mm; box-sizing: border-box;
+      padding: 1.5mm; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; overflow: hidden; page-break-inside: avoid; break-inside: avoid; background: #fff;
+    }
+    .label-name { font-weight: 700; margin: 0; line-height: 1.15; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: ${(format.w * 0.16).toFixed(1)}px; }
+    .label-price { font-weight: 800; margin: 0.6mm 0; line-height: 1; font-size: ${(format.w * 0.30).toFixed(1)}px; }
+    .label-currency { font-weight: 600; font-size: ${(format.w * 0.12).toFixed(1)}px; margin-left: 1mm; }
+    .label-qr { width: ${(format.h * 0.5).toFixed(1)}mm; height: ${(format.h * 0.5).toFixed(1)}mm; margin: 0.6mm 0; }
+    .label-qrmissing { width: ${(format.h * 0.5).toFixed(1)}mm; height: ${(format.h * 0.5).toFixed(1)}mm; margin: 0.6mm 0; border: 1px solid #DC2626; color: #DC2626; font-size: 5px; display: flex; align-items: center; justify-content: center; text-align: center; line-height: 1.15; }
+    .label-barcode { width: 90%; max-height: ${(format.h * 0.22).toFixed(1)}mm; object-fit: contain; margin: 0.5mm 0; }
+    .label-sku { font-size: ${Math.max(5, format.w * 0.09).toFixed(1)}px; font-family: 'Courier New', monospace; color: #444; margin: 0; }
+  `;
+  if (mode === "thermal") {
+    return base + `
+      body { padding: 2mm; }
+      .sheet { display: flex; flex-direction: column; align-items: center; gap: ${LABEL_GAP_MM}mm; }
+      @page { size: ${format.w + 4}mm auto; margin: 2mm; }
+    `;
+  }
+  return base + `
+    body { padding: ${PAGE_MARGIN_MM}mm; }
+    .sheet { display: grid; grid-template-columns: repeat(${gridColumns(format)}, ${format.w}mm); gap: ${LABEL_GAP_MM}mm; justify-content: start; }
+    @page { size: A4 portrait; margin: ${PAGE_MARGIN_MM}mm; }
+  `;
+}
+
+// Rendu HTML d'une étiquette (aperçu + impression navigateur) — jamais d'image produit, uniquement texte + QR/code-barres réels
+function labelMarkup({ product: p, qrDataUrl, barcodeDataUrl }, format) {
+  const o = QR_LABEL_OPTIONS;
+  const priceText = `${fmtNumberOnly(p.sellingPrice)}${o.currency ? ` <span class="label-currency">GNF</span>` : ""}`;
+  return `
+    <div class="label">
+      ${o.name ? `<p class="label-name">${p.name}</p>` : ""}
+      ${o.price ? `<p class="label-price">${priceText}</p>` : ""}
+      ${o.qr ? (qrDataUrl ? `<img class="label-qr" src="${qrDataUrl}" />` : `<div class="label-qrmissing">⚠ Erreur QR<br>(voir console)</div>`) : ""}
+      ${o.barcode && barcodeDataUrl ? `<img class="label-barcode" src="${barcodeDataUrl}" />` : ""}
+      ${o.sku ? `<p class="label-sku">${p.qrCode}</p>` : ""}
+    </div>`;
+}
+
+async function generateLabelsPreview() {
+  const btn = document.getElementById("btn-labels-preview");
+  if (!checkLabelLibraries()) return;
+  try {
+    if (btn) btn.disabled = true;
+    const format = LABEL_FORMATS[QR_LABEL_FORMAT_KEY];
+    const items = await buildLabelsData();
+    if (items.length === 0) { toast("Sélectionne au moins un produit.", "danger"); return; }
+    const wrap = document.getElementById("labels-preview-wrap");
+    const css = buildLabelCss(format, QR_PRINT_MODE);
+    if (QR_PRINT_MODE === "thermal") {
+      wrap.innerHTML = `
+        <div class="card p-4 overflow-x-auto space-y-2">
+          <p class="text-xs text-ink-400">${items.length} étiquette(s) — mode rouleau thermique continu (${format.label}).</p>
+          <style>${css}</style>
+          <div class="sheet" style="border:1px solid #E6EAF2; padding:3mm;">${items.map(it => labelMarkup(it, format)).join("")}</div>
+        </div>`;
+    } else {
+      const perPage = labelsPerPage(format);
+      const pages = paginateLabels(items, perPage);
+      wrap.innerHTML = `
+        <div class="card p-4 overflow-x-auto space-y-4">
+          <p class="text-xs text-ink-400">${items.length} étiquette(s) sur ${pages.length} page(s) A4 (${format.label}, ${gridColumns(format)} × ${gridRows(format)} par page).</p>
+          <style>${css}</style>
+          ${pages.map((pageItems, idx) => `
+            <div>
+              <p class="text-xs font-medium text-ink-600 mb-1">Page ${idx + 1} / ${pages.length}</p>
+              <div class="sheet" style="border:1px solid #E6EAF2; padding:4mm;">${pageItems.map(it => labelMarkup(it, format)).join("")}</div>
+            </div>`).join("")}
+        </div>`;
+    }
+    toast("Aperçu généré.");
+  } catch (err) {
+    reportError("génération de l'aperçu", err);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function printLabelsA4() {
+  // La fenêtre doit être ouverte de façon SYNCHRONE, dans le même clic utilisateur,
+  // sinon le navigateur bloque le popup une fois qu'on est passé par un "await" (async).
+  const win = window.open("", "_blank", "width=900,height=700");
+  if (!win) { toast("Le navigateur a bloqué la fenêtre d'impression. Autorise les popups pour ce site puis réessaie.", "danger"); return; }
+  win.document.write(`<html><head><title>Étiquettes</title></head><body style="font-family:sans-serif;padding:24px;color:#475467;">Génération des étiquettes en cours…</body></html>`);
+  win.document.close();
+
+  if (!checkLabelLibraries()) { win.close(); return; }
+
+  const btn = document.getElementById("btn-labels-print");
+  try {
+    if (btn) btn.disabled = true;
+    const format = LABEL_FORMATS[QR_LABEL_FORMAT_KEY];
+    const items = await buildLabelsData();
+    if (items.length === 0) { win.close(); toast("Sélectionne au moins un produit.", "danger"); return; }
+    const css = buildLabelCss(format, QR_PRINT_MODE);
+    let bodyHtml;
+    if (QR_PRINT_MODE === "thermal") {
+      bodyHtml = `<div class="sheet">${items.map(it => labelMarkup(it, format)).join("")}</div>`;
+    } else {
+      const perPage = labelsPerPage(format);
+      const pages = paginateLabels(items, perPage);
+      bodyHtml = pages.map((pageItems, idx) =>
+        `<div class="sheet"${idx < pages.length - 1 ? ' style="page-break-after: always;"' : ""}>${pageItems.map(it => labelMarkup(it, format)).join("")}</div>`
+      ).join("");
+    }
+    win.document.open();
+    win.document.write(`<html><head><title>Étiquettes</title><style>${css}</style></head>
+      <body>${bodyHtml}
+      <script>window.onload = () => window.print();<\/script>
+      </body></html>`);
+    win.document.close();
+  } catch (err) {
+    reportError("impression des étiquettes", err);
+    try { win.close(); } catch (e) {}
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Dessine UNE étiquette directement dans le PDF avec les primitives natives de jsPDF (texte + image QR/code-barres déjà en Data URL).
+// Aucune capture DOM (pas de html2canvas) : reste rapide même avec des milliers d'étiquettes.
+function drawLabelOnPdf(pdf, item, x0, y0, w, h) {
+  const o = QR_LABEL_OPTIONS;
+  const cx = x0 + w / 2;
+  let cursorY = y0 + 2.5;
+
+  pdf.setDrawColor(200, 200, 200);
+  pdf.setLineWidth(0.1);
+  if (typeof pdf.setLineDashPattern === "function") pdf.setLineDashPattern([0.7, 0.7], 0);
+  pdf.rect(x0, y0, w, h);
+  if (typeof pdf.setLineDashPattern === "function") pdf.setLineDashPattern([], 0);
+  pdf.setTextColor(20, 20, 20);
+
+  if (o.name) {
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(Math.max(6, w * 0.85));
+    let name = item.product.name;
+    const maxWidth = w - 4;
+    while (pdf.getTextWidth(name) > maxWidth && name.length > 3) name = name.slice(0, -2) + "…";
+    pdf.text(name, cx, cursorY + 2, { align: "center" });
+    cursorY += 4.5;
+  }
+  if (o.price) {
+    pdf.setFont("helvetica", "bold");
+    pdf.setFontSize(Math.max(11, w * 0.32));
+    const priceStr = fmtNumberOnly(item.product.sellingPrice) + (o.currency ? " GNF" : "");
+    pdf.text(priceStr, cx, cursorY + 5, { align: "center" });
+    cursorY += 7.5;
+  }
+  if (o.qr) {
+    const qrSize = Math.min(h * 0.42, w * 0.55);
+    if (item.qrDataUrl) {
+      pdf.addImage(item.qrDataUrl, "PNG", cx - qrSize / 2, cursorY, qrSize, qrSize);
+    } else {
+      pdf.setDrawColor(220, 38, 38);
+      pdf.rect(cx - qrSize / 2, cursorY, qrSize, qrSize);
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(5);
+      pdf.setTextColor(220, 38, 38);
+      pdf.text("Erreur QR", cx, cursorY + qrSize / 2, { align: "center" });
+      pdf.setTextColor(20, 20, 20);
+    }
+    cursorY += qrSize + 1.2;
+  }
+  if (o.barcode && item.barcodeDataUrl) {
+    const bw = w * 0.85, bh = Math.min(h * 0.16, 7);
+    pdf.addImage(item.barcodeDataUrl, "PNG", cx - bw / 2, cursorY, bw, bh);
+    cursorY += bh + 1;
+  }
+  if (o.sku) {
+    pdf.setFont("courier", "normal");
+    pdf.setFontSize(Math.max(5, w * 0.09));
+    pdf.text(item.product.qrCode, cx, y0 + h - 1.3, { align: "center" });
+  }
+}
+
+// Génère un véritable fichier PDF (jsPDF pur) et déclenche son téléchargement automatique.
+// Les QR/codes-barres sont déjà générés (voir buildLabelsData → Promise.all) avant d'arriver ici.
+async function downloadLabelsPdf() {
+  const btn = document.getElementById("btn-labels-pdf");
+  if (!checkLabelLibraries()) return;
+  try {
+    if (btn) btn.disabled = true;
+    const format = LABEL_FORMATS[QR_LABEL_FORMAT_KEY];
+    const items = await buildLabelsData();
+    if (items.length === 0) { toast("Sélectionne au moins un produit.", "danger"); return; }
+    toast(`Génération du PDF (${items.length} étiquette(s))…`);
+
+    const { jsPDF } = window.jspdf;
+    const c = DB.company || DEFAULT_COMPANY;
+    const baseName = (c.name || "superette").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+    if (QR_PRINT_MODE === "thermal") {
+      const orientation = format.w >= format.h ? "landscape" : "portrait";
+      const pdf = new jsPDF({ unit: "mm", format: [format.w, format.h], orientation });
+      items.forEach((item, idx) => {
+        if (idx > 0) pdf.addPage([format.w, format.h], orientation);
+        drawLabelOnPdf(pdf, item, 0, 0, format.w, format.h);
+      });
+      pdf.save(`etiquettes-${baseName}-thermique.pdf`);
+    } else {
+      const pdf = new jsPDF({ unit: "mm", format: "a4", orientation: "portrait" });
+      const cols = gridColumns(format), rows = gridRows(format);
+      const perPage = cols * rows;
+      const usedW = cols * format.w + (cols - 1) * LABEL_GAP_MM;
+      const usedH = rows * format.h + (rows - 1) * LABEL_GAP_MM;
+      const offsetX = Math.max(PAGE_MARGIN_MM, (A4_W_MM - usedW) / 2);
+      const offsetY = Math.max(PAGE_MARGIN_MM, (A4_H_MM - usedH) / 2);
+
+      const pages = paginateLabels(items, perPage);
+      pages.forEach((pageItems, pageIdx) => {
+        if (pageIdx > 0) pdf.addPage();
+        pageItems.forEach((item, i) => {
+          const col = i % cols, row = Math.floor(i / cols);
+          const x = offsetX + col * (format.w + LABEL_GAP_MM);
+          const y = offsetY + row * (format.h + LABEL_GAP_MM);
+          drawLabelOnPdf(pdf, item, x, y, format.w, format.h);
+        });
+      });
+      pdf.save(`etiquettes-${baseName}-a4.pdf`);
+    }
+    toast("PDF téléchargé avec succès.");
+  } catch (err) {
+    reportError("génération du PDF", err);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Réutilisée par le bouton "Étiquette" de la liste des produits (une seule étiquette, mêmes réglages format/options en cours)
+function printLabel(id) {
+  const previous = QR_LABELS_SELECTED;
+  QR_LABELS_SELECTED = { [id]: 1 };
+  printLabelsA4().finally(() => { QR_LABELS_SELECTED = previous; });
+}
+</script>
+<script>
+/* ============================================================
+   CLIENTS
+   ============================================================ */
+function renderClients() {
+  const root = document.getElementById("page-root");
+  root.innerHTML = `
+    <div class="card">
+      <div class="flex items-center justify-between p-5 border-b border-border">
+        <h2 class="font-display font-semibold text-base">Clients (${DB.clients.length})</h2>
+        <button class="btn-primary" onclick="openClientForm()">+ Nouveau client</button>
+      </div>
+      <table class="data w-full">
+        <thead><tr><th>Nom</th><th>Téléphone</th><th>Adresse</th><th>Dette</th><th></th></tr></thead>
+        <tbody>${DB.clients.map(c => `<tr>
+          <td class="font-medium">${c.name}</td>
+          <td class="text-ink-600 font-mono">${c.phone || "—"}</td>
+          <td class="text-ink-600">${c.address || "—"}</td>
+          <td class="font-mono ${c.debt > 0 ? "text-warning font-semibold" : ""}">${fmtGNF(c.debt || 0)}</td>
+          <td class="text-right">
+            <button class="btn-ghost !px-2 !py-1" onclick='openClientForm(${JSON.stringify(c.id)})'>Modifier</button>
+            <button class="btn-danger !px-2 !py-1" onclick="deleteClient('${c.id}')">Supprimer</button>
+          </td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+}
+function openClientForm(id) {
+  const c = id ? DB.clients.find(x => x.id === id) : null;
+  openModal(c ? "Modifier le client" : "Nouveau client", `
+    <div class="space-y-4">
+      <div><label class="label">Nom complet</label><input id="f-name" class="input" value="${c?.name || ""}" /></div>
+      <div><label class="label">Téléphone</label><input id="f-phone" class="input" value="${c?.phone || ""}" /></div>
+      <div><label class="label">Adresse</label><input id="f-address" class="input" value="${c?.address || ""}" /></div>
+      <div><label class="label">Dette actuelle (GNF)</label><input id="f-debt" type="number" class="input" value="${c?.debt ?? 0}" /></div>
+      <div><label class="label">Notes</label><input id="f-notes" class="input" value="${c?.notes || ""}" /></div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+        <button class="btn-primary" onclick="saveClient(${id ? `'${id}'` : "null"})">Enregistrer</button>
+      </div>
+    </div>`);
+}
+async function saveClient(id) {
+  const name = document.getElementById("f-name").value.trim();
+  if (!name) return toast("Le nom est requis.", "danger");
+  const data = {
+    name, phone: document.getElementById("f-phone").value.trim(),
+    address: document.getElementById("f-address").value.trim(),
+    debt: Number(document.getElementById("f-debt").value) || 0,
+    notes: document.getElementById("f-notes").value.trim(),
+  };
+  try {
+    if (id) await Api.clients.update(id, data);
+    else await Api.clients.create(data);
+    DB.clients = await Api.clients.list();
+    closeModal(); toast("Client enregistré."); renderClients();
+  } catch (err) { toast(err.message, "danger"); }
+}
+async function deleteClient(id) {
+  if (!confirm("Supprimer ce client ?")) return;
+  try {
+    await Api.clients.remove(id);
+    DB.clients = await Api.clients.list();
+    toast("Client supprimé."); renderClients();
+  } catch (err) { toast(err.message, "danger"); }
+}
+
+/* ============================================================
+   FOURNISSEURS
+   ============================================================ */
+function renderFournisseurs() {
+  const root = document.getElementById("page-root");
+  root.innerHTML = `
+    <div class="card">
+      <div class="flex items-center justify-between p-5 border-b border-border">
+        <h2 class="font-display font-semibold text-base">Fournisseurs (${DB.suppliers.length})</h2>
+        <button class="btn-primary" onclick="openSupplierForm()">+ Nouveau fournisseur</button>
+      </div>
+      <table class="data w-full">
+        <thead><tr><th>Nom</th><th>Téléphone</th><th>Adresse</th><th>Notes</th><th></th></tr></thead>
+        <tbody>${DB.suppliers.map(s => `<tr>
+          <td class="font-medium">${s.name}</td>
+          <td class="text-ink-600 font-mono">${s.phone || "—"}</td>
+          <td class="text-ink-600">${s.address || "—"}</td>
+          <td class="text-ink-600">${s.notes || "—"}</td>
+          <td class="text-right">
+            <button class="btn-ghost !px-2 !py-1" onclick='openSupplierForm(${JSON.stringify(s.id)})'>Modifier</button>
+            <button class="btn-danger !px-2 !py-1" onclick="deleteSupplier('${s.id}')">Supprimer</button>
+          </td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+}
+function openSupplierForm(id) {
+  const s = id ? DB.suppliers.find(x => x.id === id) : null;
+  openModal(s ? "Modifier le fournisseur" : "Nouveau fournisseur", `
+    <div class="space-y-4">
+      <div><label class="label">Nom</label><input id="f-name" class="input" value="${s?.name || ""}" /></div>
+      <div><label class="label">Téléphone</label><input id="f-phone" class="input" value="${s?.phone || ""}" /></div>
+      <div><label class="label">Adresse</label><input id="f-address" class="input" value="${s?.address || ""}" /></div>
+      <div><label class="label">Notes</label><input id="f-notes" class="input" value="${s?.notes || ""}" /></div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+        <button class="btn-primary" onclick="saveSupplier(${id ? `'${id}'` : "null"})">Enregistrer</button>
+      </div>
+    </div>`);
+}
+async function saveSupplier(id) {
+  const name = document.getElementById("f-name").value.trim();
+  if (!name) return toast("Le nom est requis.", "danger");
+  const data = {
+    name, phone: document.getElementById("f-phone").value.trim(),
+    address: document.getElementById("f-address").value.trim(),
+    notes: document.getElementById("f-notes").value.trim(),
+  };
+  try {
+    if (id) await Api.suppliers.update(id, data);
+    else await Api.suppliers.create(data);
+    DB.suppliers = await Api.suppliers.list();
+    closeModal(); toast("Fournisseur enregistré."); renderFournisseurs();
+  } catch (err) { toast(err.message, "danger"); }
+}
+async function deleteSupplier(id) {
+  if (!confirm("Supprimer ce fournisseur ?")) return;
+  try {
+    await Api.suppliers.remove(id);
+    DB.suppliers = await Api.suppliers.list();
+    toast("Fournisseur supprimé."); renderFournisseurs();
+  } catch (err) { toast(err.message, "danger"); }
+}
+</script>
+<script>
+/* ============================================================
+   PARAMÈTRES DE L'ENTREPRISE — utilisées sur reçus, étiquettes, QR codes, en-tête
+   ============================================================ */
+// Convertit un fichier image sélectionné en chaîne Base64 (stockage direct dans localStorage)
+// Convertit un fichier image en Base64, en le redimensionnant d'abord via canvas (image "légère").
+// Corrige à la source le bug de sauvegarde des paramètres : une photo de téléphone non redimensionnée
+// (plusieurs Mo) peut à elle seule dépasser le quota de localStorage et faire échouer l'enregistrement.
+function fileToBase64(file, callback, maxDim = 600) {
+  if (!file) return callback(null);
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) {
+        const scale = Math.min(maxDim / width, maxDim / height);
+        width = Math.round(width * scale);
+        height = Math.round(height * scale);
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      // PNG conservé pour les logos (transparence) ; JPEG compressé pour les photos produit — le redimensionnement
+      // à lui seul réduit déjà le poids de façon drastique (une photo 4000×3000 devient ≤600×450).
+      const isPng = file.type === "image/png";
+      callback(canvas.toDataURL(isPng ? "image/png" : "image/jpeg", isPng ? undefined : 0.85));
+    };
+    img.onerror = () => { toast("Image invalide ou corrompue.", "danger"); callback(null); };
+    img.src = reader.result;
+  };
+  reader.onerror = () => { toast("Impossible de lire l'image.", "danger"); callback(null); };
+  reader.readAsDataURL(file);
+}
+
+// Applique le nom / logo de l'entreprise partout où ils sont affichés (barre latérale + écran de connexion)
+function applyCompanyBranding() {
+  const c = DB.company || DEFAULT_COMPANY;
+  const initial = (c.name || "S").charAt(0).toUpperCase();
+  [["brand-logo-sidebar", "brand-name-sidebar"], ["brand-logo-login", "brand-name-login"]].forEach(([logoId, nameId]) => {
+    const logoEl = document.getElementById(logoId);
+    const nameEl = document.getElementById(nameId);
+    if (logoEl) logoEl.innerHTML = c.logo ? `<img src="${c.logo}" class="w-full h-full object-cover" />` : initial;
+    if (nameEl) nameEl.textContent = c.name || "Supérette";
+  });
+  document.title = `${c.name || "Supérette"} — Gestion`;
+}
+
+let PARAM_LOGO_PREVIEW = null; // Base64 temporaire pendant l'édition, avant enregistrement
+
+function renderParametres() {
+  const root = document.getElementById("page-root");
+  if (CURRENT_USER.role !== "ADMIN") {
+    root.innerHTML = `<div class="card p-8 text-center text-sm text-ink-400">Accès réservé aux administrateurs.</div>`;
+    return;
+  }
+  const c = DB.company || DEFAULT_COMPANY;
+  const pr = c.printer || DEFAULT_COMPANY.printer;
+  PARAM_LOGO_PREVIEW = c.logo || null;
+  root.innerHTML = `
+    <div class="card p-6 max-w-3xl">
+      <h2 class="font-display font-semibold text-base mb-1">Informations de l'entreprise</h2>
+      <p class="text-sm text-ink-400 mb-5">Utilisées automatiquement sur les reçus, les étiquettes, les QR codes et l'en-tête de l'application.</p>
+
+      <div class="flex items-center gap-4 mb-6">
+        <div id="param-logo-preview" class="w-20 h-20 rounded-xl bg-navy-50 border border-border flex items-center justify-center overflow-hidden shrink-0">
+          ${c.logo ? `<img src="${c.logo}" class="w-full h-full object-cover" />` : `<span class="text-ink-400 text-xs">Aucun logo</span>`}
+        </div>
+        <div>
+          <label class="label">Logo de l'entreprise</label>
+          <input id="f-logo" type="file" accept="image/*" class="text-sm" />
+          <button type="button" class="text-xs text-danger hover:underline mt-1.5 block" onclick="clearCompanyLogo()">Supprimer le logo</button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-4">
+        <div class="col-span-2"><label class="label">Nom de l'entreprise / supérette</label><input id="f-name" class="input" value="${c.name || ""}" /></div>
+        <div><label class="label">Nom du propriétaire</label><input id="f-owner" class="input" value="${c.ownerName || ""}" /></div>
+        <div><label class="label">Slogan</label><input id="f-slogan" class="input" value="${c.slogan || ""}" /></div>
+        <div><label class="label">Numéro de téléphone principal</label><input id="f-phone" class="input" value="${c.phone || ""}" /></div>
+        <div><label class="label">Numéro WhatsApp</label><input id="f-whatsapp" class="input" value="${c.whatsapp || ""}" /></div>
+        <div class="col-span-2"><label class="label">Adresse complète</label><input id="f-address" class="input" value="${c.address || ""}" /></div>
+        <div><label class="label">Ville</label><input id="f-city" class="input" value="${c.city || ""}" /></div>
+        <div><label class="label">Pays</label><input id="f-country" class="input" value="${c.country || ""}" /></div>
+        <div><label class="label">E-mail</label><input id="f-email" type="email" class="input" value="${c.email || ""}" /></div>
+        <div><label class="label">Site Web</label><input id="f-website" class="input" value="${c.website || ""}" placeholder="www.exemple.com" /></div>
+        <div><label class="label">RCCM</label><input id="f-rccm" class="input" value="${c.rccm || ""}" /></div>
+        <div><label class="label">NIF</label><input id="f-nif" class="input" value="${c.nif || ""}" /></div>
+        <div><label class="label">Devise</label><input id="f-currency" class="input" value="${c.currency || "GNF"}" /></div>
+        <div><label class="label">Fuseau horaire</label><input id="f-timezone" class="input" value="${c.timezone || "Africa/Conakry"}" /></div>
+        <div><label class="label">Latitude (GPS)</label><input id="f-lat" class="input" value="${c.lat ?? ""}" placeholder="ex : 9.6412" /></div>
+        <div><label class="label">Longitude (GPS)</label><input id="f-lng" class="input" value="${c.lng ?? ""}" placeholder="ex : -13.5784" /></div>
+      </div>
+
+      <div class="flex justify-between items-center pt-6 mt-2 border-t border-border">
+        <button class="btn-ghost !text-danger" onclick="restoreCompanyDefaults()">↺ Restaurer les valeurs par défaut</button>
+        <button class="btn-primary" onclick="saveCompanySettings()">Enregistrer</button>
+      </div>
+    </div>
+
+    <div class="card p-6 max-w-3xl mt-4">
+      <h2 class="font-display font-semibold text-base mb-1">Configuration de l'imprimante</h2>
+      <p class="text-sm text-ink-400 mb-5">Détermine le format des tickets imprimés (caisse). Architecture compatible ESC/POS — prête pour une future connexion USB, Bluetooth ou réseau.</p>
+
+      <div class="mb-5">
+        <label class="label">Modèle / type d'imprimante</label>
+        <select id="f-printer-type" class="input max-w-xs">
+          <option value="POS58" ${pr.type === "POS58" ? "selected" : ""}>POS58 (58 mm, thermique)</option>
+          <option value="POS80" ${pr.type === "POS80" ? "selected" : ""}>POS80 (80 mm, thermique)</option>
+          <option value="EPSON" ${pr.type === "EPSON" ? "selected" : ""}>Epson (thermique ESC/POS)</option>
+          <option value="XPRINTER" ${pr.type === "XPRINTER" ? "selected" : ""}>XPrinter (thermique ESC/POS)</option>
+          <option value="SUNMI" ${pr.type === "SUNMI" ? "selected" : ""}>Sunmi (terminal intégré)</option>
+          <option value="A4" ${pr.type === "A4" ? "selected" : ""}>Imprimante A4 (facture classique)</option>
+          <option value="AUTRE" ${pr.type === "AUTRE" ? "selected" : ""}>Autre imprimante thermique ESC/POS</option>
+        </select>
+        <p class="text-xs text-ink-400 mt-1.5">${pr.type === "A4" ? "Format facture A4 complète." : pr.type === "POS58" ? "Ticket étroit 58 mm." : "Ticket 80 mm (ou équivalent) — le format le plus courant pour les thermiques ESC/POS."}</p>
+      </div>
+
+      <label class="label mb-2 block">Éléments affichés sur le ticket</label>
+      <div class="grid grid-cols-2 sm:grid-cols-3 gap-y-2 gap-x-4 text-sm mb-5">
+        ${[["showLogo", "Logo"], ["showName", "Nom de la supérette"], ["showAddress", "Adresse"], ["showPhone", "Téléphone"],
+          ["showTaxIds", "NIF / RCCM"], ["showCashier", "Nom du caissier"], ["showDateTime", "Date et heure"],
+          ["showTicketNumber", "Numéro du ticket"], ["showQr", "QR Code"], ["showThanks", "Message de remerciement"]]
+          .map(([key, label]) => `<label class="flex items-center gap-1.5"><input type="checkbox" id="f-printer-${key}" ${pr[key] ? "checked" : ""} /> ${label}</label>`).join("")}
+      </div>
+
+      <label class="flex items-center gap-1.5 text-sm mb-2"><input type="checkbox" id="f-printer-showTerms" ${pr.showTerms ? "checked" : ""} /> Conditions de vente</label>
+      <textarea id="f-printer-termsText" class="input" rows="2" placeholder="Ex : Articles vendus non repris ni échangés.">${pr.termsText || ""}</textarea>
+
+      <div class="flex justify-end pt-5 mt-2 border-t border-border">
+        <button class="btn-primary" onclick="saveCompanySettings()">Enregistrer</button>
+      </div>
+    </div>
+
+    <div class="card p-6 max-w-3xl mt-4 border-danger/30">
+      <h2 class="font-display font-semibold text-base mb-1 text-danger">Zone sensible</h2>
+      <p class="text-sm text-ink-400 mb-4">Réinitialise entièrement l'application : produits, ventes, clients, fournisseurs et utilisateurs seront supprimés. Un compte administrateur par défaut sera recréé pour la reconnexion.</p>
+      <button class="btn-danger" onclick="resetApplicationData()">Réinitialiser toutes les données</button>
+    </div>`;
+
+  document.getElementById("f-logo").addEventListener("change", (e) => {
+    fileToBase64(e.target.files[0], (base64) => {
+      if (!base64) return;
+      PARAM_LOGO_PREVIEW = base64;
+      document.getElementById("param-logo-preview").innerHTML = `<img src="${base64}" class="w-full h-full object-cover" />`;
+    });
+  });
+}
+
+function clearCompanyLogo() {
+  PARAM_LOGO_PREVIEW = null;
+  const preview = document.getElementById("param-logo-preview");
+  if (preview) preview.innerHTML = `<span class="text-ink-400 text-xs">Aucun logo</span>`;
+  const input = document.getElementById("f-logo");
+  if (input) input.value = "";
+}
+
+async function saveCompanySettings() {
+  const name = document.getElementById("f-name").value.trim();
+  if (!name) return toast("Le nom de l'entreprise est requis.", "danger");
+  const newCompany = {
+    name,
+    ownerName: document.getElementById("f-owner").value.trim(),
+    slogan: document.getElementById("f-slogan").value.trim(),
+    phone: document.getElementById("f-phone").value.trim(),
+    whatsapp: document.getElementById("f-whatsapp").value.trim(),
+    address: document.getElementById("f-address").value.trim(),
+    city: document.getElementById("f-city").value.trim(),
+    country: document.getElementById("f-country").value.trim(),
+    email: document.getElementById("f-email").value.trim(),
+    website: document.getElementById("f-website").value.trim(),
+    rccm: document.getElementById("f-rccm").value.trim(),
+    nif: document.getElementById("f-nif").value.trim(),
+    currency: document.getElementById("f-currency").value.trim() || "GNF",
+    timezone: document.getElementById("f-timezone").value.trim() || "Africa/Conakry",
+    lat: document.getElementById("f-lat").value.trim(),
+    lng: document.getElementById("f-lng").value.trim(),
+    logo: PARAM_LOGO_PREVIEW,
+    printer: {
+      type: document.getElementById("f-printer-type").value,
+      showLogo: document.getElementById("f-printer-showLogo").checked,
+      showName: document.getElementById("f-printer-showName").checked,
+      showAddress: document.getElementById("f-printer-showAddress").checked,
+      showPhone: document.getElementById("f-printer-showPhone").checked,
+      showTaxIds: document.getElementById("f-printer-showTaxIds").checked,
+      showCashier: document.getElementById("f-printer-showCashier").checked,
+      showDateTime: document.getElementById("f-printer-showDateTime").checked,
+      showTicketNumber: document.getElementById("f-printer-showTicketNumber").checked,
+      showQr: document.getElementById("f-printer-showQr").checked,
+      showThanks: document.getElementById("f-printer-showThanks").checked,
+      showTerms: document.getElementById("f-printer-showTerms").checked,
+      termsText: document.getElementById("f-printer-termsText").value.trim(),
+    },
+  };
+  try {
+    DB.company = await Api.settings.update(newCompany);
+    applyCompanyBranding();
+    toast("Informations de l'entreprise enregistrées.");
+  } catch (err) {
+    toast(`Échec de l'enregistrement : ${err.message}`, "danger"); // l'ancien DB.company reste inchangé : jamais de faux succès
+  }
+}
+
+async function restoreCompanyDefaults() {
+  if (!confirm("Restaurer les valeurs par défaut ? Les informations personnalisées de l'entreprise seront effacées.")) return;
+  try {
+    DB.company = await Api.settings.update({ ...DEFAULT_COMPANY, printer: { ...DEFAULT_COMPANY.printer } });
+    applyCompanyBranding();
+    renderParametres();
+    toast("Valeurs par défaut restaurées.");
+  } catch (err) {
+    toast(`Échec de la restauration : ${err.message}`, "danger");
+  }
+}
+</script>
+<script>
+/* ============================================================
+   UTILISATEURS (réservé ADMIN)
+   ============================================================ */
+function renderUtilisateurs() {
+  const root = document.getElementById("page-root");
+  if (!canSeePage(CURRENT_USER, "utilisateurs")) {
+    root.innerHTML = `<div class="card p-8 text-center text-sm text-ink-400">🔒 Accès réservé.</div>`;
+    return;
+  }
+  root.innerHTML = `
+    <div class="card">
+      <div class="flex items-center justify-between p-5 border-b border-border">
+        <h2 class="font-display font-semibold text-base">Utilisateurs (${DB.users.length})</h2>
+        <button class="btn-primary" onclick="openUserForm()">+ Nouvel utilisateur</button>
+      </div>
+      <table class="data w-full">
+        <thead><tr><th>Nom</th><th>E-mail</th><th>Rôle</th><th>Menus autorisés</th><th>Statut</th><th></th></tr></thead>
+        <tbody>${DB.users.map(u => `<tr>
+          <td class="font-medium">${u.name}</td>
+          <td class="text-ink-600 font-mono">${u.email}</td>
+          <td><span class="text-xs font-medium px-2 py-1 rounded-full bg-navy-50 text-navy-700">${roleLabel(u.role)}</span></td>
+          <td class="text-xs text-ink-400 max-w-[220px]">${u.role === "ADMIN" ? "Accès complet" : (PERMISSION_PAGES.filter(p => canSeePage(u, p.key)).map(p => p.label).join(", ") || "Aucun")}</td>
+          <td>${u.isActive ? '<span class="text-xs text-accent-600 font-medium">Actif</span>' : '<span class="text-xs text-ink-400">Inactif</span>'}</td>
+          <td class="text-right">
+            <button class="btn-ghost !px-2 !py-1" onclick='openUserForm(${JSON.stringify(u.id)})'>Modifier</button>
+            ${u.id !== CURRENT_USER.id ? `<button class="btn-danger !px-2 !py-1" onclick="deleteUser('${u.id}')">Supprimer</button>` : ""}
+          </td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+}
+// Génère la liste de cases à cocher des menus, en masquant totalement ceux verrouillés pour ce rôle
+// (le Caissier ne doit même pas VOIR une case "Rapports" qu'il ne pourrait de toute façon jamais cocher).
+function permissionCheckboxesHtml(role, currentPermissions) {
+  const blocked = HARD_BLOCKED_PAGES[role] || [];
+  const perms = currentPermissions || DEFAULT_PERMISSIONS_BY_ROLE[role] || [];
+  const rows = PERMISSION_PAGES.filter(p => !blocked.includes(p.key)).map(p => `
+    <label class="flex items-center gap-1.5 text-sm"><input type="checkbox" class="f-perm" value="${p.key}" ${perms.includes(p.key) ? "checked" : ""} /> ${p.label}</label>`).join("");
+  const financialsChecked = role === "GERANT" && perms.includes("financials");
+  return `
+    <div class="grid grid-cols-2 gap-y-2 gap-x-3">${rows}</div>
+    ${role === "GERANT" ? `
+      <label class="flex items-center gap-1.5 text-sm pt-2 mt-2 border-t border-border">
+        <input type="checkbox" id="f-perm-financials" ${financialsChecked ? "checked" : ""} /> Autoriser à voir les marges et bénéfices (Tableau de bord / Rapports)
+      </label>` : ""}
+    ${blocked.length ? `<p class="text-xs text-ink-400 pt-2">🔒 ${blocked.map(k => PERMISSION_PAGES.find(p => p.key === k)?.label).join(", ")} : toujours inaccessible pour ce rôle, quelle que soit la configuration.</p>` : ""}`;
+}
+function refreshPermissionsPanel() {
+  const role = document.getElementById("f-role").value;
+  const panel = document.getElementById("f-permissions-panel");
+  panel.innerHTML = role === "ADMIN"
+    ? `<p class="text-sm text-ink-400">L'administrateur a toujours un accès complet et inconditionnel — aucune restriction possible.</p>`
+    : permissionCheckboxesHtml(role, DEFAULT_PERMISSIONS_BY_ROLE[role]);
+}
+function openUserForm(id) {
+  const u = id ? DB.users.find(x => x.id === id) : null;
+  openModal(u ? "Modifier l'utilisateur" : "Nouvel utilisateur", `
+    <div class="space-y-4">
+      <div><label class="label">Nom complet</label><input id="f-name" class="input" value="${u?.name || ""}" /></div>
+      <div><label class="label">E-mail</label><input id="f-email" type="email" class="input" value="${u?.email || ""}" /></div>
+      <div><label class="label">Mot de passe</label><input id="f-password" class="input" placeholder="${u ? "Laisser vide pour ne pas changer" : ""}" /></div>
+      <div><label class="label">Rôle</label>
+        <select id="f-role" class="input">
+          <option value="CAISSIER" ${u?.role === "CAISSIER" ? "selected" : ""}>Caissier</option>
+          <option value="GERANT" ${u?.role === "GERANT" ? "selected" : ""}>Gérant</option>
+          <option value="ADMIN" ${u?.role === "ADMIN" ? "selected" : ""}>Administrateur</option>
+        </select>
+      </div>
+      <label class="flex items-center gap-2 text-sm"><input id="f-active" type="checkbox" ${u?.isActive !== false ? "checked" : ""} /> Compte actif</label>
+      <div class="pt-2 border-t border-border">
+        <label class="label mb-2 block">Menus autorisés</label>
+        <div id="f-permissions-panel">${u?.role === "ADMIN" ? `<p class="text-sm text-ink-400">L'administrateur a toujours un accès complet et inconditionnel — aucune restriction possible.</p>` : permissionCheckboxesHtml(u?.role || "CAISSIER", u?.permissions)}</div>
+      </div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+        <button class="btn-primary" onclick="saveUser(${id ? `'${id}'` : "null"})">Enregistrer</button>
+      </div>
+    </div>`);
+  document.getElementById("f-role").addEventListener("change", () => refreshPermissionsPanel());
+}
+async function saveUser(id) {
+  const name = document.getElementById("f-name").value.trim();
+  const email = document.getElementById("f-email").value.trim();
+  const password = document.getElementById("f-password").value;
+  const role = document.getElementById("f-role").value;
+  const isActive = document.getElementById("f-active").checked;
+  if (!name || !email) return toast("Nom et e-mail requis.", "danger");
+  if (!id && !password) return toast("Un mot de passe est requis à la création.", "danger");
+  if (DB.users.some(u => u.email === email && u.id !== id)) return toast("Cet e-mail est déjà utilisé.", "danger");
+
+  let permissions = [];
+  if (role !== "ADMIN") {
+    permissions = Array.from(document.querySelectorAll(".f-perm:checked")).map(el => el.value);
+    if (role === "GERANT" && document.getElementById("f-perm-financials")?.checked) permissions.push("financials");
+  }
+
+  try {
+    if (id) await Api.users.update(id, { name, email, role, isActive, permissions, password: password || undefined });
+    else await Api.users.create({ name, email, role, isActive, permissions, password });
+    DB.users = await Api.users.list();
+    closeModal(); toast("Utilisateur enregistré."); renderUtilisateurs();
+  } catch (err) { toast(err.message, "danger"); }
+}
+async function deleteUser(id) {
+  if (!confirm("Supprimer cet utilisateur ?")) return;
+  try {
+    await Api.users.remove(id);
+    DB.users = await Api.users.list();
+    toast("Utilisateur supprimé."); renderUtilisateurs();
+  } catch (err) { toast(err.message, "danger"); }
+}
+
+/* ============================================================
+   STOCK
+   ============================================================ */
+function renderStock() {
+  const root = document.getElementById("page-root");
+  const canEdit = CURRENT_USER.role !== "CAISSIER";
+  const products = DB.products.filter(p => p.isActive).sort((a, b) => (a.quantity <= a.lowStockThreshold ? -1 : 1));
+  root.innerHTML = `
+    <div class="card">
+      <div class="p-5 border-b border-border"><h2 class="font-display font-semibold text-base">Stock en temps réel (${products.length} produits)</h2></div>
+      <table class="data w-full">
+        <thead><tr><th>Produit</th><th>Quantité</th><th>Seuil d'alerte</th><th>État</th>${canEdit ? "<th></th>" : ""}</tr></thead>
+        <tbody>${products.map(p => {
+          const low = p.quantity <= p.lowStockThreshold;
+          const expired = p.expirationDate && new Date(p.expirationDate) < new Date();
+          return `<tr>
+            <td class="font-medium">${p.name}</td>
+            <td class="font-mono ${low ? "text-warning font-semibold" : ""}">${p.quantity} ${p.unit}</td>
+            <td class="font-mono text-ink-600">${p.lowStockThreshold} ${p.unit}</td>
+            <td>${expired ? '<span class="text-xs text-danger font-medium">Périmé</span>' : low ? '<span class="text-xs text-warning font-medium">Stock faible</span>' : '<span class="text-xs text-accent-600 font-medium">Correct</span>'}</td>
+            ${canEdit ? `<td class="text-right"><button class="btn-ghost !px-2 !py-1" onclick="openStockAdjust('${p.id}')">Ajuster</button></td>` : ""}
+          </tr>`;
+        }).join("")}</tbody>
+      </table>
+    </div>`;
+}
+function openStockAdjust(id) {
+  const p = DB.products.find(x => x.id === id);
+  openModal(`Ajuster le stock — ${p.name}`, `
+    <p class="text-sm text-ink-600 mb-4">Stock actuel : <span class="font-mono font-semibold">${p.quantity} ${p.unit}</span></p>
+    <div class="space-y-4">
+      <div><label class="label">Type de mouvement</label>
+        <select id="f-type" class="input">
+          <option value="ACHAT">Réassort / achat (entrée)</option>
+          <option value="PERTE">Perte / produit périmé (sortie)</option>
+          <option value="CORRECTION">Correction d'inventaire</option>
+        </select>
+      </div>
+      <div><label class="label">Quantité (positive = entrée, négative = sortie)</label><input id="f-qty" type="number" class="input" value="1" /></div>
+      <div><label class="label">Motif (optionnel)</label><input id="f-reason" class="input" /></div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+        <button class="btn-primary" onclick="applyStockAdjust('${id}')">Valider</button>
+      </div>
+    </div>`);
+}
+async function applyStockAdjust(id) {
+  const type = document.getElementById("f-type").value;
+  let qty = Number(document.getElementById("f-qty").value);
+  const reason = document.getElementById("f-reason").value.trim();
+  if (!qty) return toast("Quantité invalide.", "danger");
+  if (type === "PERTE") qty = -Math.abs(qty);
+  try {
+    await Api.stockMovements.adjust(id, type, qty, reason);
+    DB.products = await Api.products.list();
+    closeModal(); toast("Stock mis à jour."); renderStock();
+  } catch (err) { toast(err.message, "danger"); }
+}
+</script>
+<script>
+/* ============================================================
+   HISTORIQUE DES VENTES
+   ============================================================ */
+function renderVentes() {
+  const root = document.getElementById("page-root");
+  const sales = [...DB.sales].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 300);
+  root.innerHTML = `
+    <div class="card">
+      <div class="p-5 border-b border-border"><h2 class="font-display font-semibold text-base">Historique des ventes (${sales.length})</h2></div>
+      <table class="data w-full">
+        <thead><tr><th>Reçu</th><th>Date</th><th>Caissier</th><th>Articles</th><th>Paiement</th><th>Total</th><th></th></tr></thead>
+        <tbody>${sales.map(s => `<tr>
+          <td class="font-mono">${s.code}</td>
+          <td class="text-ink-600">${fmtDateTime(s.createdAt)}</td>
+          <td class="text-ink-600">${s.userName || DB.users.find(u => u.id === s.userId)?.name || "—"}</td>
+          <td class="text-ink-600">${s.items.length}</td>
+          <td class="text-ink-600">${paymentLabel(s.paymentMethod)}</td>
+          <td class="font-mono font-semibold">${fmtGNF(s.total)}</td>
+          <td class="text-right"><button class="btn-ghost !px-2 !py-1" onclick="printReceipt('${s.id}')">Reçu</button></td>
+        </tr>`).join("")}</tbody>
+      </table>
+    </div>`;
+}
+function paymentLabel(m) {
+  return { ESPECES: "Espèces", MOBILE_MONEY: "Mobile Money", CARTE: "Carte bancaire" }[m] || m;
+}
+async function printReceipt(saleId) {
+  const s = DB.sales.find(x => x.id === saleId);
+  const c = DB.company || DEFAULT_COMPANY;
+  const pr = c.printer || DEFAULT_COMPANY.printer;
+  const isA4 = pr.type === "A4";
+  const width = isA4 ? 800 : (pr.type === "POS58" ? 380 : 420);
+
+  // Fenêtre ouverte de façon SYNCHRONE (même clic) pour éviter le blocage popup, remplie ensuite.
+  const win = window.open("", "_blank", `width=${width},height=700`);
+  if (!win) { toast("Le navigateur a bloqué la fenêtre d'impression. Autorise les popups puis réessaie.", "danger"); return; }
+  win.document.write(`<html><head><title>Reçu ${s.code}</title></head><body style="font-family:sans-serif;padding:24px;color:#475467;">Génération du reçu…</body></html>`);
+  win.document.close();
+
+  let qrDataUrl = null;
+  if (pr.showQr) {
+    try {
+      const canvas = document.createElement("canvas");
+      await QRCode.toCanvas(canvas, JSON.stringify({ sale: s.code, total: s.total }), { width: 200, margin: 4, errorCorrectionLevel: "M" });
+      qrDataUrl = canvas.toDataURL("image/png");
+    } catch (err) {
+      console.error(`[Reçu] Échec génération QR pour le reçu ${s.code} :`, err);
+    }
+  }
+
+  const thermalWidth = pr.type === "POS58" ? "48mm" : "70mm"; // largeur imprimable (hors marges) pour 58mm / 80mm
+  const style = isA4 ? `
+      body{font-family:Arial,sans-serif;padding:20mm;font-size:12px;color:#101828;}
+      h2{font-size:20px;margin:0 0 4px;} p.sub{margin:0 0 3px;color:#555;font-size:12px;}
+      img.rlogo{max-height:60px;margin-bottom:8px;}
+      table{width:100%;border-collapse:collapse;margin:14px 0;} th,td{padding:6px 4px;font-size:12px;border-bottom:1px solid #E6EAF2;text-align:left;}
+      .right{text-align:right;} .totalrow{font-weight:bold;font-size:15px;} .line{border-top:1px solid #E6EAF2;margin:10px 0;}
+      @page{size:A4;margin:15mm;}
+    ` : `
+      body{font-family:'Courier New',monospace;padding:3mm;font-size:12px;color:#111;width:${thermalWidth};}
+      h2{text-align:center;margin:0 0 2px;font-size:15px;} p.sub{text-align:center;margin:0 0 2px;color:#333;font-size:10.5px;}
+      img.rlogo{display:block;margin:0 auto 6px;max-height:40px;}
+      img.rqr{display:block;margin:8px auto 4px;width:26mm;height:26mm;}
+      table{width:100%;border-collapse:collapse;margin-bottom:8px;} td{padding:2px 0;font-size:11px;}
+      .line{border-top:1px dashed #999;margin:6px 0;} .right{text-align:right;} .totalrow{font-weight:bold;font-size:13px;}
+      @page{size:${pr.type === "POS58" ? "58mm" : "80mm"} auto;margin:2mm;}
+    `;
+
+  const itemsHtml = isA4
+    ? `<table><thead><tr><th>Produit</th><th class="right">Qté</th><th class="right">P.U.</th><th class="right">Total</th></tr></thead>
+        <tbody>${s.items.map(i => `<tr><td>${i.productName}</td><td class="right">${i.quantity}</td><td class="right">${fmtGNF(i.unitPrice)}</td><td class="right">${fmtGNF(i.subtotal)}</td></tr>`).join("")}</tbody></table>`
+    : `<table>${s.items.map(i => `<tr><td colspan="2">${i.productName}</td></tr><tr><td>${i.quantity} x ${fmtGNF(i.unitPrice)}</td><td class="right">${fmtGNF(i.subtotal)}</td></tr>`).join("")}</table>`;
+
+  win.document.open();
+  win.document.write(`
+    <html><head><title>Reçu ${s.code}</title><style>${style}</style></head><body>
+    ${pr.showLogo && c.logo ? `<img class="rlogo" src="${c.logo}" />` : ""}
+    ${pr.showName ? `<h2>${(c.name || "SUPÉRETTE").toUpperCase()}</h2>` : ""}
+    ${pr.showAddress && (c.address || c.city) ? `<p class="sub">${[c.address, c.city].filter(Boolean).join(", ")}</p>` : ""}
+    ${pr.showPhone && c.phone ? `<p class="sub">Tél : ${c.phone}</p>` : ""}
+    ${pr.showTaxIds && (c.rccm || c.nif) ? `<p class="sub">${[c.rccm ? `RCCM : ${c.rccm}` : "", c.nif ? `NIF : ${c.nif}` : ""].filter(Boolean).join(" — ")}</p>` : ""}
+    ${pr.showTicketNumber || pr.showDateTime ? `<p class="sub" style="margin-top:8px;">${pr.showTicketNumber ? `Reçu ${s.code}` : ""}${pr.showTicketNumber && pr.showDateTime ? " — " : ""}${pr.showDateTime ? fmtDateTime(s.createdAt) : ""}</p>` : ""}
+    ${pr.showCashier ? `<p class="sub">Caissier : ${s.userName || ""}</p>` : ""}
+    <div class="line"></div>
+    ${itemsHtml}
+    <div class="line"></div>
+    <table>
+      <tr><td>Sous-total</td><td class="right">${fmtGNF(s.subtotal)}</td></tr>
+      ${s.discount ? `<tr><td>Remise</td><td class="right">-${fmtGNF(s.discount)}</td></tr>` : ""}
+      ${s.tax ? `<tr><td>TVA</td><td class="right">${fmtGNF(s.tax)}</td></tr>` : ""}
+      <tr class="totalrow"><td>TOTAL</td><td class="right">${fmtGNF(s.total)}</td></tr>
+      ${s.isCredit ? `<tr><td>Payé</td><td class="right">${fmtGNF(sumPayments(s))}</td></tr><tr><td>Reste à payer</td><td class="right">${fmtGNF(s.total - sumPayments(s))}</td></tr>` : ""}
+    </table>
+    <div class="line"></div>
+    <p class="sub">Paiement : ${s.isCredit ? "Vente à crédit" : paymentLabel(s.paymentMethod)}</p>
+    ${qrDataUrl ? `<img class="rqr" src="${qrDataUrl}" />` : ""}
+    ${c.slogan ? `<p class="sub" style="margin-top:8px;font-style:italic;">${c.slogan}</p>` : ""}
+    ${pr.showThanks ? `<p class="sub">Merci de votre visite !</p>` : ""}
+    ${pr.showTerms && pr.termsText ? `<p class="sub" style="margin-top:6px;">${pr.termsText}</p>` : ""}
+    <script>window.onload = () => window.print();<\/script>
+    </body></html>`);
+  win.document.close();
+}
+</script>
+<script>
+/* ============================================================
+   RAPPORTS & ANALYSES
+   ============================================================ */
+let REPORT_PERIOD = "today";
+let REPORT_CUSTOM_START = "";
+let REPORT_CUSTOM_END = "";
+let REPORT_FILTERS = { userId: "", clientId: "", productId: "", categoryId: "", paymentMethod: "" };
+
+function startOfWeek(d) { const day = d.getDay(); const diff = day === 0 ? -6 : 1 - day; const r = new Date(d); r.setDate(d.getDate() + diff); r.setHours(0, 0, 0, 0); return r; }
+function startOfMonth(d) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+function startOfQuarter(d) { return new Date(d.getFullYear(), Math.floor(d.getMonth() / 3) * 3, 1); }
+function startOfSemester(d) { return new Date(d.getFullYear(), d.getMonth() < 6 ? 0 : 6, 1); }
+function startOfYear(d) { return new Date(d.getFullYear(), 0, 1); }
+
+const REPORT_PERIOD_LABELS = {
+  today: "Aujourd'hui", week: "Cette semaine", month: "Ce mois", quarter: "Ce trimestre",
+  semester: "Ce semestre", year: "Cette année", custom: "Période personnalisée",
+};
+
+function getPeriodRange(key) {
+  const now = new Date();
+  let start;
+  switch (key) {
+    case "today": start = todayStart(); break;
+    case "week": start = startOfWeek(now); break;
+    case "month": start = startOfMonth(now); break;
+    case "quarter": start = startOfQuarter(now); break;
+    case "semester": start = startOfSemester(now); break;
+    case "year": start = startOfYear(now); break;
+    case "custom": start = REPORT_CUSTOM_START ? new Date(REPORT_CUSTOM_START + "T00:00:00") : todayStart(); break;
+    default: start = todayStart();
+  }
+  let end = now;
+  if (key === "custom" && REPORT_CUSTOM_END) end = new Date(REPORT_CUSTOM_END + "T23:59:59");
+  const durationMs = Math.max(1, end - start);
+  const prevEnd = new Date(start.getTime() - 1);
+  const prevStart = new Date(prevEnd.getTime() - durationMs);
+  return { start, end, prevStart, prevEnd };
+}
+
+function salesInRange(start, end) {
+  return DB.sales.filter(s => { const d = new Date(s.createdAt); return d >= start && d <= end; });
+}
+function applyReportFilters(sales) {
+  const f = REPORT_FILTERS;
+  return sales.filter(s => {
+    if (f.userId && s.userId !== f.userId) return false;
+    if (f.clientId && s.clientId !== f.clientId) return false;
+    if (f.paymentMethod && s.paymentMethod !== f.paymentMethod) return false;
+    if (f.productId && !s.items.some(i => i.productId === f.productId)) return false;
+    if (f.categoryId) {
+      const ids = DB.products.filter(p => p.categoryId === f.categoryId).map(p => p.id);
+      if (!s.items.some(i => ids.includes(i.productId))) return false;
+    }
+    return true;
+  });
+}
+function computeReportStats(sales) {
+  const valid = sales.filter(s => s.status === "VALIDEE");
+  const revenue = valid.reduce((s, x) => s + x.total, 0);
+  const salesCount = valid.length;
+  const productsSold = valid.reduce((s, x) => s + x.items.reduce((a, i) => a + i.quantity, 0), 0);
+  const avgBasket = salesCount ? revenue / salesCount : 0;
+  const grossMargin = valid.reduce((sum, sale) => sum + sale.items.reduce((acc, item) => {
+    const product = DB.products.find(p => p.id === item.productId);
+    const cost = (product?.purchasePrice ?? 0) * item.quantity;
+    return acc + (item.subtotal - cost);
+  }, 0), 0);
+  const totalDiscount = valid.reduce((s, x) => s + (x.discount || 0), 0);
+  return { revenue, salesCount, productsSold, avgBasket, grossMargin, totalDiscount };
+}
+function computeEmployeeStats(sales) {
+  const byUser = {};
+  sales.filter(s => s.status === "VALIDEE").forEach(s => {
+    const uid = s.userId;
+    if (!byUser[uid]) byUser[uid] = { userId: uid, name: s.userName || DB.users.find(u => u.id === uid)?.name || "—", salesCount: 0, revenue: 0, profit: 0, discount: 0, productsSold: 0 };
+    const b = byUser[uid];
+    b.salesCount++; b.revenue += s.total; b.discount += (s.discount || 0);
+    b.productsSold += s.items.reduce((a, i) => a + i.quantity, 0);
+    b.profit += s.items.reduce((acc, item) => {
+      const product = DB.products.find(p => p.id === item.productId);
+      const cost = (product?.purchasePrice ?? 0) * item.quantity;
+      return acc + (item.subtotal - cost);
+    }, 0);
+  });
+  return Object.values(byUser).sort((a, b) => b.revenue - a.revenue);
+}
+function computeTopProducts(sales, limit = 10) {
+  const byProduct = {};
+  sales.filter(s => s.status === "VALIDEE").forEach(s => s.items.forEach(item => {
+    if (!byProduct[item.productId]) byProduct[item.productId] = { name: item.productName, qty: 0, revenue: 0 };
+    byProduct[item.productId].qty += item.quantity;
+    byProduct[item.productId].revenue += item.subtotal;
+  }));
+  return Object.values(byProduct).sort((a, b) => b.revenue - a.revenue).slice(0, limit);
+}
+function bucketSalesForChart(sales, start, end) {
+  const days = Math.ceil((end - start) / 86400000);
+  let bucketKey, labelFn;
+  if (days <= 31) { bucketKey = d => d.toDateString(); labelFn = d => d.toLocaleDateString("fr-FR", { day: "2-digit", month: "short" }); }
+  else if (days <= 460) { bucketKey = d => `${d.getFullYear()}-${d.getMonth()}`; labelFn = d => d.toLocaleDateString("fr-FR", { month: "short", year: "2-digit" }); }
+  else { bucketKey = d => `${d.getFullYear()}`; labelFn = d => `${d.getFullYear()}`; }
+  const map = new Map();
+  sales.filter(s => s.status === "VALIDEE").forEach(s => {
+    const d = new Date(s.createdAt);
+    const key = bucketKey(d);
+    if (!map.has(key)) map.set(key, { label: labelFn(d), total: 0, sortKey: d.getTime() });
+    map.get(key).total += s.total;
+  });
+  return [...map.values()].sort((a, b) => a.sortKey - b.sortKey);
+}
+function evolutionPct(current, previous) {
+  if (!previous) return current > 0 ? null : 0;
+  return ((current - previous) / previous) * 100;
+}
+
+function renderRapports() {
+  const root = document.getElementById("page-root");
+  const { start, end, prevStart, prevEnd } = getPeriodRange(REPORT_PERIOD);
+  const rangeSales = applyReportFilters(salesInRange(start, end));
+  const prevRangeSales = applyReportFilters(salesInRange(prevStart, prevEnd));
+  const stats = computeReportStats(rangeSales);
+  const prevStats = computeReportStats(prevRangeSales);
+  const employees = computeEmployeeStats(rangeSales);
+  const topProducts = computeTopProducts(rangeSales);
+  const evoRevenue = evolutionPct(stats.revenue, prevStats.revenue);
+  const evoLabel = (v) => v == null ? "—" : `${v >= 0 ? "▲" : "▼"} ${Math.abs(v).toFixed(1)}%`;
+  const evoColor = (v) => v == null ? "text-ink-400" : (v >= 0 ? "text-accent-600" : "text-danger");
+  const canFin = canSeeFinancials(CURRENT_USER);
+
+  root.innerHTML = `
+    <div class="space-y-4">
+      <div class="card p-4">
+        <div class="flex flex-wrap gap-2">
+          ${["today", "week", "month", "quarter", "semester", "year", "custom"].map(k => `
+            <button class="btn-ghost !px-3 !py-1.5 text-xs ${REPORT_PERIOD === k ? "!bg-navy-700 !text-white" : ""}" onclick="setReportPeriod('${k}')">${REPORT_PERIOD_LABELS[k]}</button>
+          `).join("")}
+        </div>
+        ${REPORT_PERIOD === "custom" ? `
+          <div class="flex flex-wrap items-end gap-3 mt-3 pt-3 border-t border-border">
+            <div><label class="label">Du</label><input type="date" id="report-start" class="input" value="${REPORT_CUSTOM_START}" /></div>
+            <div><label class="label">Au</label><input type="date" id="report-end" class="input" value="${REPORT_CUSTOM_END}" /></div>
+            <button class="btn-primary !py-2" onclick="applyReportCustomRange()">Appliquer</button>
+          </div>` : ""}
+      </div>
+
+      <div class="card p-4">
+        <h2 class="font-display font-semibold text-sm mb-3">Recherche avancée</h2>
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+          <div><label class="label">Employé</label><select id="report-f-user" class="input">
+            <option value="">Tous</option>${DB.users.map(u => `<option value="${u.id}" ${REPORT_FILTERS.userId === u.id ? "selected" : ""}>${u.name}</option>`).join("")}
+          </select></div>
+          <div><label class="label">Client</label><select id="report-f-client" class="input">
+            <option value="">Tous</option>${DB.clients.map(c => `<option value="${c.id}" ${REPORT_FILTERS.clientId === c.id ? "selected" : ""}>${c.name}</option>`).join("")}
+          </select></div>
+          <div><label class="label">Produit</label><select id="report-f-product" class="input">
+            <option value="">Tous</option>${DB.products.map(p => `<option value="${p.id}" ${REPORT_FILTERS.productId === p.id ? "selected" : ""}>${p.name}</option>`).join("")}
+          </select></div>
+          <div><label class="label">Catégorie</label><select id="report-f-category" class="input">
+            <option value="">Toutes</option>${DB.categories.map(c => `<option value="${c.id}" ${REPORT_FILTERS.categoryId === c.id ? "selected" : ""}>${c.name}</option>`).join("")}
+          </select></div>
+          <div><label class="label">Mode de paiement</label><select id="report-f-payment" class="input">
+            <option value="">Tous</option>
+            <option value="ESPECES" ${REPORT_FILTERS.paymentMethod === "ESPECES" ? "selected" : ""}>Espèces</option>
+            <option value="MOBILE_MONEY" ${REPORT_FILTERS.paymentMethod === "MOBILE_MONEY" ? "selected" : ""}>Mobile Money</option>
+            <option value="CARTE" ${REPORT_FILTERS.paymentMethod === "CARTE" ? "selected" : ""}>Carte bancaire</option>
+          </select></div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+        <div class="card p-5"><p class="text-xs font-medium text-ink-600 mb-2">Chiffre d'affaires</p><p class="font-mono font-semibold text-2xl">${fmtGNF(stats.revenue)}</p><p class="text-xs mt-1.5 ${evoColor(evoRevenue)}">${evoLabel(evoRevenue)} vs période précédente</p></div>
+        <div class="card p-5"><p class="text-xs font-medium text-ink-600 mb-2">Ventes</p><p class="font-mono font-semibold text-2xl">${stats.salesCount}</p><p class="text-xs text-ink-400 mt-1.5">${stats.productsSold} produit(s) vendu(s)</p></div>
+        <div class="card p-5"><p class="text-xs font-medium text-ink-600 mb-2">Panier moyen</p><p class="font-mono font-semibold text-2xl">${fmtGNF(Math.round(stats.avgBasket))}</p></div>
+        ${canFin ? `
+        <div class="card p-5"><p class="text-xs font-medium text-ink-600 mb-2">Marge brute / bénéfice estimé</p><p class="font-mono font-semibold text-2xl">${fmtGNF(Math.round(stats.grossMargin))}</p><p class="text-xs text-ink-400 mt-1.5">Remises accordées : ${fmtGNF(stats.totalDiscount)}</p></div>` : `
+        <div class="card p-5"><p class="text-xs font-medium text-ink-600 mb-2">Marge brute / bénéfice estimé</p><p class="font-mono font-semibold text-lg text-ink-400">🔒 Masqué</p></div>`}
+      </div>
+
+      <div class="card p-5">
+        <h2 class="font-display font-semibold text-sm mb-4">Évolution des ventes — ${REPORT_PERIOD_LABELS[REPORT_PERIOD]}</h2>
+        <canvas id="reportChart" height="90"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="p-5 border-b border-border flex items-center justify-between">
+          <h2 class="font-display font-semibold text-base">Performance par employé</h2>
+        </div>
+        <table class="data w-full">
+          <thead><tr><th>#</th><th>Employé</th><th>Ventes</th><th>Produits vendus</th><th>Chiffre d'affaires</th>${canFin ? "<th>Bénéfice</th>" : ""}<th>Remises</th><th>Annulations</th><th>Retours</th></tr></thead>
+          <tbody>${employees.length === 0 ? `<tr><td colspan="${canFin ? 9 : 8}" class="text-center text-ink-400 py-6">Aucune vente sur cette période.</td></tr>` : employees.map((e, i) => `
+            <tr>
+              <td class="font-mono text-ink-400">${i + 1}</td>
+              <td>${e.name}</td>
+              <td class="font-mono">${e.salesCount}</td>
+              <td class="font-mono">${e.productsSold}</td>
+              <td class="font-mono font-semibold">${fmtGNF(e.revenue)}</td>
+              ${canFin ? `<td class="font-mono">${fmtGNF(Math.round(e.profit))}</td>` : ""}
+              <td class="font-mono">${fmtGNF(e.discount)}</td>
+              <td class="font-mono text-ink-400">0</td>
+              <td class="font-mono text-ink-400">0</td>
+            </tr>`).join("")}</tbody>
+        </table>
+        <p class="text-xs text-ink-400 px-5 py-3 border-t border-border">Annulations et retours : ce module n'existe pas encore dans le point de vente actuel (aucune vente n'est aujourd'hui annulable ou retournable) — ces colonnes afficheront des valeurs réelles dès qu'un tel workflow sera ajouté au POS.</p>
+      </div>
+
+      <div class="card">
+        <div class="p-5 border-b border-border"><h2 class="font-display font-semibold text-base">🏆 Classement des meilleurs vendeurs (produits)</h2></div>
+        <table class="data w-full">
+          <thead><tr><th>#</th><th>Produit</th><th>Quantité vendue</th><th>Chiffre d'affaires</th></tr></thead>
+          <tbody>${topProducts.length === 0 ? `<tr><td colspan="4" class="text-center text-ink-400 py-6">Aucune vente sur cette période.</td></tr>` : topProducts.map((p, i) => `
+            <tr><td class="font-mono text-ink-400">${i + 1}</td><td>${p.name}</td><td class="font-mono">${p.qty}</td><td class="font-mono font-semibold">${fmtGNF(p.revenue)}</td></tr>`).join("")}</tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="p-5 border-b border-border flex flex-wrap items-center justify-between gap-3">
+          <h2 class="font-display font-semibold text-base">Détail des ventes (${rangeSales.length})</h2>
+          <div class="flex flex-wrap gap-2">
+            <button class="btn-ghost" onclick="printReport()">🖨️ Imprimer</button>
+            <button class="btn-ghost" onclick="exportReportCsv()">⬇️ CSV</button>
+            <button class="btn-ghost" onclick="exportReportXlsx()">⬇️ Excel (.xlsx)</button>
+            <button class="btn-primary" onclick="exportReportPdf()">⬇️ PDF</button>
+          </div>
+        </div>
+        <div class="max-h-96 overflow-y-auto">
+          <table class="data w-full">
+            <thead><tr><th>Reçu</th><th>Date</th><th>Employé</th><th>Client</th><th>Paiement</th><th>Remise</th><th>Total</th></tr></thead>
+            <tbody>${rangeSales.length === 0 ? `<tr><td colspan="7" class="text-center text-ink-400 py-6">Aucune vente sur cette période.</td></tr>` : [...rangeSales].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).map(s => `
+              <tr>
+                <td class="font-mono">${s.code}</td>
+                <td class="text-ink-600">${fmtDateTime(s.createdAt)}</td>
+                <td class="text-ink-600">${s.userName || "—"}</td>
+                <td class="text-ink-600">${DB.clients.find(c => c.id === s.clientId)?.name || "—"}</td>
+                <td class="text-ink-600">${paymentLabel(s.paymentMethod)}</td>
+                <td class="font-mono">${s.discount ? fmtGNF(s.discount) : "—"}</td>
+                <td class="font-mono font-semibold">${fmtGNF(s.total)}</td>
+              </tr>`).join("")}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+
+  ["user", "client", "product", "category", "payment"].forEach(key => {
+    document.getElementById(`report-f-${key}`).addEventListener("change", (e) => {
+      const map = { user: "userId", client: "clientId", product: "productId", category: "categoryId", payment: "paymentMethod" };
+      REPORT_FILTERS[map[key]] = e.target.value;
+      renderRapports();
+    });
+  });
+
+  const chartData = bucketSalesForChart(rangeSales, start, end);
+  if (window._reportChart) window._reportChart.destroy();
+  if (typeof Chart !== "undefined") {
+    window._reportChart = new Chart(document.getElementById("reportChart"), {
+      type: "bar",
+      data: { labels: chartData.map(b => b.label), datasets: [{ data: chartData.map(b => b.total), backgroundColor: "#1E3A5F", borderRadius: 4 }] },
+      options: {
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => fmtGNF(c.parsed.y) } } },
+        scales: { x: { grid: { display: false }, ticks: { color: "#98A2B3", font: { size: 11 } } }, y: { grid: { color: "#E6EAF2" }, ticks: { color: "#98A2B3", font: { size: 11 } } } }
+      }
+    });
+  } else {
+    document.getElementById("reportChart").outerHTML = `<p class="text-sm text-ink-400">Chart.js n'a pas pu être chargé depuis le CDN (vérifie la connexion Internet) — le graphique ne peut pas s'afficher, mais les chiffres ci-dessus restent exacts.</p>`;
+  }
+}
+
+function setReportPeriod(key) { REPORT_PERIOD = key; renderRapports(); }
+function applyReportCustomRange() {
+  REPORT_CUSTOM_START = document.getElementById("report-start").value;
+  REPORT_CUSTOM_END = document.getElementById("report-end").value;
+  if (!REPORT_CUSTOM_START || !REPORT_CUSTOM_END) return toast("Sélectionne une date de début et de fin.", "danger");
+  renderRapports();
+}
+
+function currentReportRows() {
+  const { start, end } = getPeriodRange(REPORT_PERIOD);
+  return [...applyReportFilters(salesInRange(start, end))].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+}
+function printReport() {
+  const { start, end } = getPeriodRange(REPORT_PERIOD);
+  const stats = computeReportStats(currentReportRows());
+  const c = DB.company || DEFAULT_COMPANY;
+  const rows = currentReportRows();
+  const win = window.open("", "_blank", "width=900,height=700");
+  if (!win) { toast("Le navigateur a bloqué la fenêtre d'impression. Autorise les popups puis réessaie.", "danger"); return; }
+  win.document.write(`<html><head><title>Rapport</title>
+    <style>
+      body{font-family:Arial,sans-serif;padding:24px;color:#101828;}
+      h1{font-size:18px;margin:0 0 2px;} p.meta{color:#667085;font-size:12px;margin:2px 0;}
+      img.logo{max-height:48px;margin-bottom:8px;}
+      table{width:100%;border-collapse:collapse;margin-top:16px;} th,td{border-bottom:1px solid #E6EAF2;text-align:left;padding:6px 8px;font-size:12px;}
+      th{color:#98A2B3;text-transform:uppercase;font-size:10px;} .totals{margin-top:14px;font-size:13px;} footer{margin-top:24px;font-size:11px;color:#98A2B3;}
+    </style></head><body>
+    ${c.logo ? `<img class="logo" src="${c.logo}" />` : ""}
+    <h1>${(c.name || "Supérette").toUpperCase()} — Rapport des ventes</h1>
+    <p class="meta">Période : ${REPORT_PERIOD_LABELS[REPORT_PERIOD]} (${fmtDate(start)} → ${fmtDate(end)})</p>
+    <p class="meta">Généré le ${fmtDateTime(new Date().toISOString())} par ${CURRENT_USER.name}</p>
+    <div class="totals">
+      <p><strong>Chiffre d'affaires :</strong> ${fmtGNF(stats.revenue)} · <strong>Ventes :</strong> ${stats.salesCount} · <strong>Panier moyen :</strong> ${fmtGNF(Math.round(stats.avgBasket))} · <strong>Marge brute :</strong> ${fmtGNF(Math.round(stats.grossMargin))}</p>
+    </div>
+    <table><thead><tr><th>Reçu</th><th>Date</th><th>Employé</th><th>Paiement</th><th>Remise</th><th>Total</th></tr></thead>
+      <tbody>${rows.map(s => `<tr><td>${s.code}</td><td>${fmtDateTime(s.createdAt)}</td><td>${s.userName || ""}</td><td>${paymentLabel(s.paymentMethod)}</td><td>${s.discount ? fmtGNF(s.discount) : "—"}</td><td>${fmtGNF(s.total)}</td></tr>`).join("")}</tbody>
+    </table>
+    <footer>${c.name || "Supérette"} — ${[c.address, c.city].filter(Boolean).join(", ")}</footer>
+    <script>window.onload = () => window.print();<\/script>
+    </body></html>`);
+  win.document.close();
+}
+function exportReportCsv() {
+  const rows = currentReportRows();
+  const header = ["Reçu", "Date", "Employé", "Client", "Paiement", "Remise", "Total"];
+  const lines = [header.join(";")];
+  rows.forEach(s => {
+    lines.push([s.code, fmtDateTime(s.createdAt), s.userName || "", DB.clients.find(c => c.id === s.clientId)?.name || "", paymentLabel(s.paymentMethod), s.discount || 0, s.total].map(v => `"${String(v).replace(/"/g, '""')}"`).join(";"));
+  });
+  const blob = new Blob(["\uFEFF" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `rapport-ventes-${REPORT_PERIOD}-${Date.now()}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast("Export CSV téléchargé.");
+}
+function exportReportXlsx() {
+  if (typeof XLSX === "undefined") {
+    reportError("export Excel", "XLSX (SheetJS) non chargée — vérifie la connexion Internet (chargée depuis un CDN) puis réessaie.");
+    return;
+  }
+  const rows = currentReportRows().map(s => ({
+    Reçu: s.code, Date: fmtDateTime(s.createdAt), Employé: s.userName || "", Client: DB.clients.find(c => c.id === s.clientId)?.name || "",
+    Paiement: paymentLabel(s.paymentMethod), Remise: s.discount || 0, Total: s.total,
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Ventes");
+  XLSX.writeFile(wb, `rapport-ventes-${REPORT_PERIOD}-${Date.now()}.xlsx`);
+  toast("Export Excel téléchargé.");
+}
+function exportReportPdf() {
+  if (!window.jspdf || !window.jspdf.jsPDF) { reportError("export PDF", "jsPDF non chargée — vérifie la connexion Internet (chargée depuis un CDN) puis réessaie."); return; }
+  const { start, end } = getPeriodRange(REPORT_PERIOD);
+  const stats = computeReportStats(currentReportRows());
+  const rows = currentReportRows();
+  const c = DB.company || DEFAULT_COMPANY;
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit: "mm", format: "a4" });
+  let y = 15;
+  pdf.setFont("helvetica", "bold"); pdf.setFontSize(14);
+  pdf.text(`${(c.name || "Supérette").toUpperCase()} — Rapport des ventes`, 14, y); y += 6;
+  pdf.setFont("helvetica", "normal"); pdf.setFontSize(9); pdf.setTextColor(100);
+  pdf.text(`Période : ${REPORT_PERIOD_LABELS[REPORT_PERIOD]} (${fmtDate(start)} -> ${fmtDate(end)})`, 14, y); y += 5;
+  pdf.text(`Généré le ${fmtDateTime(new Date().toISOString())} par ${CURRENT_USER.name}`, 14, y); y += 7;
+  pdf.setTextColor(20); pdf.setFont("helvetica", "bold"); pdf.setFontSize(10);
+  pdf.text(`CA : ${fmtGNF(stats.revenue)}   Ventes : ${stats.salesCount}   Panier moyen : ${fmtGNF(Math.round(stats.avgBasket))}   Marge : ${fmtGNF(Math.round(stats.grossMargin))}`, 14, y); y += 8;
+  pdf.setFont("helvetica", "bold"); pdf.setFontSize(8);
+  const cols = [14, 44, 84, 114, 144, 164, 184];
+  ["Reçu", "Date", "Employé", "Paiement", "Remise", "Total"].forEach((h, i) => pdf.text(h, cols[i], y));
+  y += 2; pdf.setDrawColor(220); pdf.line(14, y, 196, y); y += 4;
+  pdf.setFont("helvetica", "normal");
+  rows.forEach(s => {
+    if (y > 285) { pdf.addPage(); y = 15; }
+    pdf.text(String(s.code), cols[0], y);
+    pdf.text(fmtDateTime(s.createdAt), cols[1], y);
+    pdf.text(String(s.userName || "").slice(0, 16), cols[2], y);
+    pdf.text(paymentLabel(s.paymentMethod), cols[3], y);
+    pdf.text(s.discount ? fmtGNF(s.discount) : "—", cols[4], y);
+    pdf.text(fmtGNF(s.total), cols[5], y);
+    y += 5;
+  });
+  pdf.setFontSize(7); pdf.setTextColor(150);
+  pdf.text(`${c.name || "Supérette"} — ${[c.address, c.city].filter(Boolean).join(", ")}`, 14, 292);
+  pdf.save(`rapport-ventes-${REPORT_PERIOD}-${Date.now()}.pdf`);
+  toast("Export PDF téléchargé.");
+}
+</script>
+<script>
+/* ============================================================
+   CAISSE (POINT DE VENTE)
+   ============================================================ */
+let CAISSE_SEARCH = "";
+
+function renderCaisse() {
+  const root = document.getElementById("page-root");
+  root.innerHTML = `
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 items-start">
+      <div class="lg:col-span-2 space-y-4">
+        <div class="card p-4">
+          <div class="flex gap-2">
+            <input id="caisse-search" class="input" placeholder="Rechercher un produit ou saisir/coller un code QR..." value="${CAISSE_SEARCH}" />
+            <button class="btn-accent whitespace-nowrap" onclick="openScannerModal()">📷 Scanner</button>
+          </div>
+          <div id="caisse-not-found" class="hidden mt-2 flex items-center justify-between gap-3 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            <p class="text-sm text-danger">Produit introuvable.</p>
+            <button id="caisse-create-from-search" class="btn-ghost !py-1 !px-2 text-xs shrink-0 hidden" onclick="createProductFromSearch()">+ Créer un nouveau produit</button>
+          </div>
+        </div>
+        <div class="card p-4">
+          <div id="caisse-product-grid" class="grid grid-cols-2 sm:grid-cols-3 gap-3"></div>
+        </div>
+      </div>
+
+      <div class="card p-4 lg:sticky lg:top-20">
+        <h2 class="font-display font-semibold text-sm mb-3">Panier (<span id="cart-count">0</span>)</h2>
+        <div id="cart-items" class="space-y-2 max-h-80 overflow-y-auto mb-3"></div>
+        <div class="border-t border-border pt-3 space-y-2">
+          <div><label class="label">Client (optionnel)</label>
+            <select id="cart-client" class="input">
+              <option value="">Vente comptant</option>
+              ${DB.clients.map(c => `<option value="${c.id}">${c.name}</option>`).join("")}
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-2">
+            <div><label class="label">Remise (GNF)</label><input id="cart-discount" type="number" class="input" value="0" /></div>
+            <div><label class="label">TVA (%)</label><input id="cart-tax" type="number" class="input" value="0" /></div>
+          </div>
+          <div><label class="label">Moyen de paiement</label>
+            <select id="cart-payment" class="input">
+              <option value="ESPECES">Espèces</option>
+              <option value="MOBILE_MONEY">Mobile Money</option>
+              <option value="CARTE">Carte bancaire</option>
+            </select>
+          </div>
+          <label class="flex items-center gap-2 text-sm font-medium pt-1">
+            <input type="checkbox" id="cart-is-credit" /> Vente à crédit
+          </label>
+          <div id="credit-fields" class="hidden space-y-2 border border-amber-300 bg-amber-50 rounded-lg p-3">
+            <p class="text-xs text-amber-800">Le client sélectionné ci-dessus est obligatoire pour une vente à crédit.</p>
+            <div><label class="label">Montant payé (GNF)</label><input id="cart-amount-paid" type="number" class="input" value="0" min="0" /></div>
+            <div class="flex items-center justify-between text-sm"><span class="text-ink-600">Montant restant</span><span id="cart-amount-remaining" class="font-mono font-semibold">0 GNF</span></div>
+            <div><label class="label">Date d'échéance (optionnel)</label><input id="cart-due-date" type="date" class="input" /></div>
+            <div><label class="label">Observations (optionnel)</label><textarea id="cart-credit-notes" class="input" rows="2"></textarea></div>
+          </div>
+          <div class="flex items-center justify-between pt-2 text-sm"><span class="text-ink-600">Sous-total</span><span id="cart-subtotal" class="font-mono">0 GNF</span></div>
+          <div class="flex items-center justify-between font-semibold text-base"><span>Total</span><span id="cart-total" class="font-mono">0 GNF</span></div>
+          <button class="btn-accent w-full mt-2" onclick="validateSale()">Valider la vente</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="credit-history-section"></div>`;
+
+  document.getElementById("caisse-search").addEventListener("input", (e) => {
+    // La saisie ne fait que filtrer la grille visuellement — la recherche/ajout au panier
+    // se fait exclusivement sur Entrée (voir plus bas), comme sur une vraie caisse professionnelle.
+    CAISSE_SEARCH = e.target.value;
+    hideCaisseNotFound();
+    renderProductGrid();
+  });
+  document.getElementById("caisse-search").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    searchAndAddToCart();
+  });
+  document.getElementById("caisse-search").focus();
+  document.getElementById("cart-is-credit").addEventListener("change", (e) => {
+    document.getElementById("credit-fields").classList.toggle("hidden", !e.target.checked);
+    renderCart();
+  });
+  document.getElementById("cart-amount-paid").addEventListener("input", renderCart);
+  renderProductGrid();
+  renderCart();
+  renderCreditHistory();
+}
+
+function renderProductGrid() {
+  const grid = document.getElementById("caisse-product-grid");
+  if (!grid) return;
+  const canSeeStock = CURRENT_USER.role !== "CAISSIER";
+  const list = DB.products.filter(p => p.isActive && p.quantity > 0 &&
+    (p.name.toLowerCase().includes(CAISSE_SEARCH.toLowerCase()) || p.qrCode.toLowerCase().includes(CAISSE_SEARCH.toLowerCase())));
+  grid.innerHTML = list.slice(0, 30).map(p => `
+    <button onclick="addToCart('${p.id}')" class="text-left border border-border rounded-lg overflow-hidden bg-white hover:border-navy-400 hover:shadow-card active:scale-[0.98] transition-all">
+      <div class="w-full aspect-square bg-navy-50 overflow-hidden">
+        <img src="${p.imageUrl || DEFAULT_PRODUCT_IMAGE}" class="w-full h-full object-cover" loading="lazy" />
+      </div>
+      <div class="p-2.5">
+        <p class="text-sm font-medium leading-tight line-clamp-2 min-h-[2.4em]">${p.name}</p>
+        <p class="text-[11px] text-ink-400 font-mono mt-1">${p.qrCode}</p>
+        <div class="flex items-center justify-between mt-1.5">
+          <p class="font-mono text-sm font-semibold">${fmtGNF(p.sellingPrice)}</p>
+          ${canSeeStock ? `<p class="text-[11px] text-ink-400 shrink-0 ml-1">${p.quantity} ${p.unit}</p>` : ""}
+        </div>
+      </div>
+    </button>`).join("") || `<p class="col-span-full text-sm text-ink-400 text-center py-6">Aucun produit trouvé.</p>`;
+}
+
+// ---- Recherche par scan (douchette USB/Bluetooth/2.4GHz, scanner QR/code-barres) ou saisie manuelle ----
+// Entrée est le SEUL déclencheur de recherche : jamais d'ouverture automatique du formulaire de création,
+// jamais d'ajout accidentel pendant la frappe. Le champ reste focus après chaque action pour scanner en continu.
+function searchAndAddToCart() {
+  const input = document.getElementById("caisse-search");
+  const raw = CAISSE_SEARCH.trim();
+  hideCaisseNotFound();
+  if (!raw) return;
+
+  const code = extractQrCode(raw);
+  const exact = DB.products.find(p => p.isActive && (p.qrCode.toLowerCase() === code.toLowerCase() || (p.barcode && p.barcode.toLowerCase() === code.toLowerCase())));
+
+  if (exact) {
+    addToCart(exact.id); // incrémente automatiquement la quantité si le produit est déjà dans le panier
+    input.value = ""; CAISSE_SEARCH = "";
+    renderProductGrid();
+  } else {
+    console.warn(`[Scanner] Code introuvable : "${raw}" (saisi/scanné le ${new Date().toLocaleString("fr-FR")} par ${CURRENT_USER.name})`);
+    showCaisseNotFound(raw);
+  }
+  input.focus(); // le champ reste actif pour continuer à scanner sans souris
+}
+function showCaisseNotFound(rawCode) {
+  const panel = document.getElementById("caisse-not-found");
+  const createBtn = document.getElementById("caisse-create-from-search");
+  panel.classList.remove("hidden");
+  panel.dataset.rawCode = rawCode;
+  createBtn.classList.toggle("hidden", CURRENT_USER.role === "CAISSIER");
+}
+function hideCaisseNotFound() {
+  document.getElementById("caisse-not-found")?.classList.add("hidden");
+}
+// Action volontaire uniquement (clic explicite) — la création n'est jamais déclenchée automatiquement par Entrée
+function createProductFromSearch() {
+  hideCaisseNotFound();
+  document.getElementById("caisse-search").value = ""; CAISSE_SEARCH = "";
+  openProductForm(null);
+}
+
+function addToCart(productId) {
+  const product = DB.products.find(p => p.id === productId && p.isActive);
+  if (!product) return toast("Produit introuvable pour ce code.", "danger");
+  if (product.quantity <= 0) return toast("Stock épuisé pour ce produit.", "danger");
+  const line = CART.find(l => l.productId === productId);
+  if (line) {
+    if (line.quantity + 1 > product.quantity) return toast("Quantité disponible dépassée.", "danger");
+    line.quantity += 1;
+  } else {
+    CART.push({ productId, quantity: 1 });
+  }
+  renderCart();
+  toast(`${product.name} ajouté.`);
+}
+function updateCartQty(productId, delta) {
+  const product = DB.products.find(p => p.id === productId);
+  const line = CART.find(l => l.productId === productId);
+  if (!line) return;
+  const next = line.quantity + delta;
+  if (next <= 0) { CART = CART.filter(l => l.productId !== productId); }
+  else if (next > product.quantity) { toast("Quantité disponible dépassée.", "danger"); return; }
+  else { line.quantity = next; }
+  renderCart();
+}
+function removeFromCart(productId) {
+  CART = CART.filter(l => l.productId !== productId);
+  renderCart();
+}
+function renderCart() {
+  const container = document.getElementById("cart-items");
+  if (!container) return;
+  document.getElementById("cart-count").textContent = CART.reduce((s, l) => s + l.quantity, 0);
+  if (CART.length === 0) {
+    container.innerHTML = `<p class="text-sm text-ink-400 text-center py-6">Panier vide. Scanne ou clique un produit.</p>`;
+  } else {
+    container.innerHTML = CART.map(l => {
+      const p = DB.products.find(pr => pr.id === l.productId);
+      return `<div class="flex items-center justify-between gap-2 text-sm">
+        <div class="min-w-0"><p class="truncate font-medium">${p.name}</p><p class="text-xs text-ink-400 font-mono">${fmtGNF(p.sellingPrice)} x ${l.quantity}</p></div>
+        <div class="flex items-center gap-1 shrink-0">
+          <button class="w-6 h-6 rounded bg-navy-50 text-navy-700" onclick="updateCartQty('${l.productId}', -1)">−</button>
+          <span class="font-mono w-5 text-center">${l.quantity}</span>
+          <button class="w-6 h-6 rounded bg-navy-50 text-navy-700" onclick="updateCartQty('${l.productId}', 1)">+</button>
+          <button class="ml-1 text-ink-400 hover:text-danger" onclick="removeFromCart('${l.productId}')">&times;</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+  const subtotal = CART.reduce((s, l) => s + DB.products.find(p => p.id === l.productId).sellingPrice * l.quantity, 0);
+  const discount = Number(document.getElementById("cart-discount")?.value || 0);
+  const taxRate = Number(document.getElementById("cart-tax")?.value || 0);
+  const taxedBase = Math.max(subtotal - discount, 0);
+  const tax = (taxedBase * taxRate) / 100;
+  const total = taxedBase + tax;
+  document.getElementById("cart-subtotal").textContent = fmtGNF(subtotal);
+  document.getElementById("cart-total").textContent = fmtGNF(total);
+
+  const amountPaidEl = document.getElementById("cart-amount-paid");
+  if (amountPaidEl) {
+    const paid = Math.max(0, Number(amountPaidEl.value || 0));
+    const remaining = Math.max(0, total - paid);
+    document.getElementById("cart-amount-remaining").textContent = fmtGNF(remaining);
+  }
+
+  ["cart-discount", "cart-tax"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && !el._bound) { el.addEventListener("input", renderCart); el._bound = true; }
+  });
+}
+
+async function validateSale() {
+  if (CART.length === 0) return toast("Le panier est vide.", "danger");
+  for (const line of CART) {
+    const p = DB.products.find(pr => pr.id === line.productId);
+    if (!p || p.quantity < line.quantity) return toast(`Stock insuffisant pour "${p?.name}".`, "danger");
+  }
+  const discount = Number(document.getElementById("cart-discount").value || 0);
+  const taxRate = Number(document.getElementById("cart-tax").value || 0);
+  const paymentMethod = document.getElementById("cart-payment").value;
+  const clientId = document.getElementById("cart-client").value || null;
+
+  const isCredit = document.getElementById("cart-is-credit").checked;
+  let amountPaid, dueDate = null, creditNotes = "";
+  if (isCredit) {
+    if (!clientId) return toast("Sélectionne un client — obligatoire pour une vente à crédit.", "danger");
+    amountPaid = Math.max(0, Number(document.getElementById("cart-amount-paid").value || 0));
+    dueDate = document.getElementById("cart-due-date").value || null;
+    creditNotes = document.getElementById("cart-credit-notes").value.trim();
+  }
+
+  const items = CART.map(l => ({ productId: l.productId, quantity: l.quantity }));
+
+  try {
+    // Le backend gère tout, en une seule transaction : baisse de stock, création de la vente, paiement
+    // initial et créance client (voir backend/src/routes/sales.js) — jamais de perte de cohérence possible.
+    const sale = await Api.sales.create({ items, clientId, discount, taxRate, paymentMethod, isCredit, amountPaid, dueDate, notes: creditNotes });
+    DB.sales.push(sale); // affichage/impression immédiats sans dépendre de la permission "ventes"
+    DB.products = await Api.products.list();
+    if (clientId) DB.clients = await Api.clients.list();
+
+    CART = [];
+    LAST_SALE_ID = sale.id;
+    toast(isCredit ? "Vente à crédit enregistrée avec succès." : "Vente enregistrée avec succès.");
+    printReceipt(sale.id);
+    renderCaisse();
+  } catch (err) {
+    toast(err.message, "danger");
+  }
+}
+
+// ---- Ventes à crédit : solde, statut, historique des paiements ----
+function sumPayments(sale) { return (sale.payments || []).reduce((s, p) => s + p.amount, 0); }
+function creditRemaining(sale) { return Math.max(0, sale.total - sumPayments(sale)); }
+function creditStatusOf(sale) {
+  const remaining = creditRemaining(sale);
+  if (remaining <= 0) return "PAYE";
+  if (sumPayments(sale) > 0) return "PARTIEL";
+  return "IMPAYE";
+}
+function creditStatusLabel(status) {
+  return { PAYE: "Payé", PARTIEL: "Partiellement payé", IMPAYE: "Impayé" }[status] || status;
+}
+function creditStatusBadgeClass(status) {
+  return { PAYE: "bg-green-50 text-green-700", PARTIEL: "bg-amber-50 text-amber-700", IMPAYE: "bg-red-50 text-danger" }[status] || "";
+}
+
+function renderCreditHistory() {
+  const root = document.getElementById("credit-history-section");
+  if (!root) return;
+  const creditSales = DB.sales.filter(s => s.isCredit).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  if (creditSales.length === 0) { root.innerHTML = ""; return; }
+  root.innerHTML = `
+    <div class="card mt-4">
+      <div class="p-4 border-b border-border"><h2 class="font-display font-semibold text-sm">Ventes à crédit (${creditSales.length})</h2></div>
+      <table class="data w-full">
+        <thead><tr><th>Reçu</th><th>Client</th><th>Montant initial</th><th>Payé</th><th>Solde restant</th><th>Échéance</th><th>Statut</th><th></th></tr></thead>
+        <tbody>${creditSales.map(s => {
+          const client = DB.clients.find(c => c.id === s.clientId);
+          const remaining = creditRemaining(s);
+          const status = creditStatusOf(s);
+          return `<tr>
+            <td class="font-mono">${s.code}</td>
+            <td>${client?.name || "—"}</td>
+            <td class="font-mono">${fmtGNF(s.total)}</td>
+            <td class="font-mono">${fmtGNF(sumPayments(s))}</td>
+            <td class="font-mono font-semibold">${fmtGNF(remaining)}</td>
+            <td class="text-ink-400">${s.dueDate ? fmtDate(s.dueDate) : "—"}</td>
+            <td><span class="text-xs px-2 py-0.5 rounded-full ${creditStatusBadgeClass(status)}">${creditStatusLabel(status)}</span></td>
+            <td>${remaining > 0 ? `<button class="btn-ghost !px-2 !py-1 text-xs" onclick="openCreditPaymentModal('${s.id}')">Enregistrer un paiement</button>` : ""}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>
+    </div>`;
+}
+
+function openCreditPaymentModal(saleId) {
+  const sale = DB.sales.find(s => s.id === saleId);
+  const remaining = creditRemaining(sale);
+  openModal("Enregistrer un paiement", `
+    <div class="space-y-3">
+      <p class="text-sm text-ink-600">Reçu <span class="font-mono">${sale.code}</span> — solde restant : <span class="font-semibold">${fmtGNF(remaining)}</span></p>
+      <div><label class="label">Montant payé (GNF)</label><input id="f-payment-amount" type="number" class="input" value="${remaining}" min="1" max="${remaining}" /></div>
+      <div class="flex justify-end gap-2 pt-2">
+        <button class="btn-ghost" onclick="closeModal()">Annuler</button>
+        <button class="btn-primary" onclick="recordCreditPayment('${sale.id}')">Enregistrer</button>
+      </div>
+    </div>`, { size: "max-w-sm" });
+}
+
+async function recordCreditPayment(saleId) {
+  const sale = DB.sales.find(s => s.id === saleId);
+  if (!sale) return;
+  const amount = Number(document.getElementById("f-payment-amount").value || 0);
+  const remaining = creditRemaining(sale);
+  if (amount <= 0) return toast("Le montant doit être supérieur à zéro.", "danger");
+  if (amount > remaining) return toast("Le montant dépasse le solde restant.", "danger");
+  try {
+    const payment = await Api.sales.addPayment(saleId, amount);
+    sale.payments = sale.payments || [];
+    sale.payments.push(payment);
+    if (sale.clientId) DB.clients = await Api.clients.list();
+    closeModal();
+    toast("Paiement enregistré.");
+    renderCreditHistory();
+  } catch (err) {
+    toast(err.message, "danger");
+  }
+}
+
+/* ============================================================
+   SCAN CAMÉRA (QR)
+   ============================================================ */
+function openScannerModal() {
+  openModal("Scanner un code QR", `
+    <div id="qr-reader" style="width:100%"></div>
+    <p class="text-xs text-ink-400 mt-3">Autorise l'accès à la caméra. Le produit sera ajouté automatiquement au panier dès qu'un code est reconnu.</p>
+  `);
+  startScanner();
+}
+function startScanner() {
+  try {
+    SCANNER = new Html5Qrcode("qr-reader");
+    SCANNER.start(
+      { facingMode: "environment" },
+      { fps: 10, qrbox: 220 },
+      (decodedText) => {
+        const code = extractQrCode(decodedText);
+        const product = DB.products.find(p => p.isActive && p.qrCode === code);
+        if (product) {
+          addToCart(product.id);
+          closeModal();
+        } else {
+          toast("Code QR non reconnu.", "danger");
+        }
+      },
+      () => {}
+    ).catch(() => {
+      document.getElementById("qr-reader").innerHTML = `<p class="text-sm text-danger">Impossible d'accéder à la caméra. Vérifie les autorisations du navigateur, ou saisis le code manuellement dans la barre de recherche.</p>`;
+    });
+  } catch (e) {
+    document.getElementById("qr-reader").innerHTML = `<p class="text-sm text-danger">Scanner indisponible sur cet appareil. Saisis le code manuellement.</p>`;
+  }
+}
+function stopScanner() {
+  if (SCANNER) {
+    try { SCANNER.stop().then(() => SCANNER.clear()).catch(() => {}); } catch (e) {}
+    SCANNER = null;
+  }
+}
+</script>
+<script>
+/* ============================================================
+   INITIALISATION
+   ============================================================ */
+// MODE DEBUG — diagnostic des bibliothèques au démarrage. Le moteur QR est écrit en interne
+// (toujours présent, jamais chargé depuis un CDN) ; les autres bibliothèques sont chargées
+// depuis un CDN public (nécessite une connexion Internet, garantie sur un hébergement en ligne).
+function runStartupDiagnostics() {
+  console.log(`✔ Moteur QR : ${QRCode.VERSION} — toujours disponible, 100% interne, aucune dépendance réseau.`);
+  const libs = [
+    { name: "Tailwind CSS", test: () => typeof tailwind !== "undefined", file: "CDN" },
+    { name: "html5-qrcode (scanner caméra)", test: () => typeof Html5Qrcode !== "undefined", file: "CDN" },
+    { name: "Chart.js (graphiques du tableau de bord)", test: () => typeof Chart !== "undefined", file: "CDN" },
+    { name: "JsBarcode (codes-barres)", test: () => typeof JsBarcode !== "undefined", file: "CDN" },
+    { name: "jsPDF (export PDF des étiquettes et rapports)", test: () => !!(window.jspdf && window.jspdf.jsPDF), file: "CDN" },
+    { name: "SheetJS / xlsx (export Excel des rapports)", test: () => typeof XLSX !== "undefined", file: "CDN" },
+  ];
+  const missing = [];
+  libs.forEach(lib => {
+    if (lib.test()) console.log(`✔ ${lib.name} : chargée (${lib.file})`);
+    else { console.error(`✘ ${lib.name} : INTROUVABLE — dépose le fichier attendu dans ${lib.file} (à côté de ce HTML).`); missing.push(lib); }
+  });
+  if (missing.length) {
+    toast(`${missing.length} bibliothèque(s) externe(s) non chargée(s) (CDN) — vérifie la connexion Internet. Voir la console (F12) pour le détail.`, "danger");
+  }
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  runStartupDiagnostics();
+  setupMobileSidebarToggles();
+  setupKeyboardShortcuts();
+  document.getElementById("login-password").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") handleLogin();
+  });
+
+  // Branding de l'écran de connexion : lecture publique des paramètres (pas besoin d'être connecté).
+  try { DB.company = { ...DEFAULT_COMPANY, ...(await Api.settings.get()) }; } catch (err) { /* API indisponible : on garde les valeurs par défaut */ }
+  applyCompanyBranding();
+  await populateLoginUsers();
+
+  // Restauration de session : un jeton déjà valide (précédente connexion, page rafraîchie) permet de
+  // rester connecté sans ressaisir le mot de passe — remplace l'ancien sessionStorage basé sur l'ID utilisateur.
+  if (AUTH_TOKEN) {
+    try {
+      const { user } = await Api.me();
+      CURRENT_USER = user;
+      await showApp();
+    } catch (err) {
+      Api.logout(); // jeton expiré/invalide : retour à l'écran de connexion normalement
+    }
+  }
+});
+</script>
+<script>
+/* ============================================================
+   RACCOURCIS CLAVIER PROFESSIONNELS
+   ------------------------------------------------------------
+   Configuration pilotée par données : pour modifier/ajouter un raccourci plus tard,
+   il suffit d'éditer cet objet (touche -> { action, label, description }) — aucune
+   logique à toucher ailleurs. `action` est le nom d'une fonction définie plus bas
+   dans SHORTCUT_ACTIONS.
+   ============================================================ */
+const KEYBOARD_SHORTCUTS = {
+  F2: { action: "focusProductSearch", label: "F2", description: "Ouvrir la recherche de produits (bascule vers la Caisse)" },
+  F3: { action: "focusProductSearch", label: "F3", description: "Placer le curseur dans la recherche" },
+  F4: { action: "checkoutSale", label: "F4", description: "Encaisser la vente" },
+  F5: { action: "newClient", label: "F5", description: "Ajouter un nouveau client" },
+  F6: { action: "openSalesHistory", label: "F6", description: "Ouvrir l'historique des ventes" },
+  F7: { action: "newProduct", label: "F7", description: "Ajouter un nouveau produit" },
+  F8: { action: "openProductsPage", label: "F8", description: "Ouvrir la gestion des produits" },
+  F9: { action: "focusDiscount", label: "F9", description: "Appliquer une remise (si autorisée)" },
+  F10: { action: "printLastTicket", label: "F10", description: "Imprimer le dernier ticket" },
+  F11: { action: "toggleFullscreen", label: "F11", description: "Basculer en mode plein écran" },
+  Escape: { action: "closeActive", label: "Échap", description: "Fermer la fenêtre active" },
+};
+
+const SHORTCUT_ACTIONS = {
+  focusProductSearch() {
+    if (document.getElementById("page-root").querySelector("#caisse-search")) {
+      document.getElementById("caisse-search").focus();
+      document.getElementById("caisse-search").select();
+    } else if (canSeePage(CURRENT_USER, "caisse")) {
+      navigate("caisse");
+      setTimeout(() => document.getElementById("caisse-search")?.focus(), 0);
+    }
+  },
+  checkoutSale() {
+    if (document.getElementById("page-root").querySelector("#caisse-search")) validateSale();
+  },
+  newClient() {
+    if (canSeePage(CURRENT_USER, "clients") || document.getElementById("cart-client")) openClientForm();
+  },
+  openSalesHistory() {
+    if (canSeePage(CURRENT_USER, "ventes")) navigate("ventes");
+  },
+  newProduct() {
+    if (CURRENT_USER.role !== "CAISSIER" && canSeePage(CURRENT_USER, "produits")) openProductForm(null);
+  },
+  openProductsPage() {
+    if (canSeePage(CURRENT_USER, "produits")) navigate("produits");
+  },
+  focusDiscount() {
+    const el = document.getElementById("cart-discount");
+    if (el) { el.focus(); el.select(); }
+  },
+  printLastTicket() {
+    if (LAST_SALE_ID) printReceipt(LAST_SALE_ID);
+    else toast("Aucun ticket à imprimer pour le moment.", "danger");
+  },
+  toggleFullscreen() {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
+    else document.exitFullscreen?.();
+  },
+  closeActive() {
+    if (!document.getElementById("modal-backdrop").classList.contains("hidden")) { closeModal(); return; }
+    if (!document.getElementById("sidebar").classList.contains("-translate-x-full")) { closeMobileSidebar(); return; }
+    hideCaisseNotFound();
+  },
+};
+
+function setupKeyboardShortcuts() {
+  document.addEventListener("keydown", (e) => {
+    const shortcut = KEYBOARD_SHORTCUTS[e.key];
+    if (!shortcut) return;
+    if (document.getElementById("screen-app").classList.contains("hidden")) return; // pas connecté : raccourcis inactifs
+    // Aucune touche F ni Échap n'insère de caractère : les activer même quand le curseur est dans un
+    // champ (recherche, remise...) est voulu — c'est justement là qu'un caissier professionnel les utilise
+    // (ex. scanner un produit puis appuyer sur F4 sans quitter le champ de recherche).
+    e.preventDefault();
+    SHORTCUT_ACTIONS[shortcut.action]?.();
+  });
+}
+</script>
+</body>
+</html>
