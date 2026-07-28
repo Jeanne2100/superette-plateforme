@@ -18,7 +18,10 @@ module.exports = async function authenticate(req, res, next) {
     [payload.sub]
   );
   const user = rows[0];
-  if (!user || !user.is_active) return res.status(401).json({ error: "Compte introuvable ou désactivé." });
+if (!user || !user.isActive)
+  return res.status(401).json({
+    error: "Compte introuvable ou désactivé."
+  });
 
   req.user = user;
   next();
