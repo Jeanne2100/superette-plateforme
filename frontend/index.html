@@ -748,6 +748,7 @@ function navigate(page) {
 function computeSummary() {
   const start = todayStart();
   const todaySales = DB.sales.filter(s => new Date(s.createdAt) >= start && s.status === "VALIDEE");
+  console.log(todaySales);
   const revenueToday = todaySales.reduce((s, sale) => s + sale.total, 0);
   const profitToday = todaySales.reduce((sum, sale) => {
     const p = sale.items.reduce((acc, item) => {
