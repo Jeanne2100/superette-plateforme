@@ -839,7 +839,11 @@ function renderDashboard() {
     const d = new Date(Date.now() - i * 86400000);
     const key = d.toDateString();
     labels.push(d.toLocaleDateString("fr-FR", { day: "2-digit", month: "short" }));
-    const total = DB.sales.filter(s2 => new Date(s2.createdAt).toDateString() === key).reduce((sum, s2) => sum + s2.total, 0);
+    /* const total = DB.sales.filter(s2 => new Date(s2.createdAt).toDateString() === key).reduce((sum, s2) => sum + s2.total, 0); */
+
+    const total = DB.sales
+  .filter(s2 => new Date(s2.createdAt).toDateString() === key)
+  .reduce((sum, s2) => sum + Number(s2.total || 0), 0);
     values.push(total);
   }
   if (window._chart) { window._chart.destroy(); }
